@@ -1,4 +1,11 @@
-# Transformer Training in C++/CUDA
+# coalfire.cpp — Transformer Training in C++/CUDA
+
+*Formerly `transformer` — renamed 2026-08-01 (GitHub redirects the old
+URL). coalfire.cpp is the original trainer engine of the paperkiln
+family, alongside [paperkiln](https://github.com/JohnnyTeutonic/paperkiln)
+(the training studio, formerly microtorch) and
+[ember.cpp](https://github.com/JohnnyTeutonic/ember.cpp) (the inference
+half, formerly tinyllama.cpp).*
 
 A pure C++ implementation of transformer training with CUDA acceleration.
 

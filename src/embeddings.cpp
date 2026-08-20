@@ -1,4 +1,5 @@
 #include "../include/embeddings.hpp"
+#include "../include/config.hpp"
 #include "../include/lora.hpp"
 #include <algorithm>
 #include <cmath>
@@ -176,7 +177,8 @@ void TokenEmbedding::backward(const Matrix& grad_output, const std::vector<int>&
     float clip_scale = (norm > clip_threshold) ? (clip_threshold / (norm + 1e-8f)) : 1.0f;
 
     // Lazy row-wise Adam: only rows in the batch move (SparseAdam semantics).
-    const float beta1 = 0.9f, beta2 = 0.999f, adam_eps = 1e-8f;
+    const float beta1 = transformer_runtime::adam_beta1,
+                beta2 = transformer_runtime::adam_beta2, adam_eps = 1e-8f;
     const float bc1 = 1.0f - std::pow(beta1, static_cast<float>(adam_t_));
     const float bc2 = 1.0f - std::pow(beta2, static_cast<float>(adam_t_));
     for (size_t i = 0; i < weights_.rows(); i++) {

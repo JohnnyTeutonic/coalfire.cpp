@@ -259,3 +259,52 @@ servable. Moral for the paper-adjacent record: verify train==deploy
 function equality with differential activation traces before interpreting
 any quality result; "the metric was lying" outranks most modeling
 hypotheses in prior probability.
+
+## Finding 5 — tcpp9a cannot survive a Colab reclaim (2026-07-27)
+
+**The v9a lane will never finish as configured.** Observed 08:36 today, after
+the supervisor relaunched it following a reclaim:
+
+```
+[RESUME PROBE] measured=8 batched=7 checkpoint-recorded=0.6 (1754 positions)
+[RESUME PROBE] RESTORED MODEL DOES NOT MATCH ITS CHECKPOINT
+  (measured 7.75525 vs recorded 0.5577). Discarding the restore and
+  training from scratch instead of training a corrupt model.
+--- Epoch 1/40 ---
+```
+
+The guard in `src/train_wikitext.cpp:1442-1459` is behaving **correctly**. It
+judges on the batched measurement, deliberately, because single-sequence forward
+routes through the fused no-RoPE kernel that neither training nor deployment
+uses and false-alarms on good restores. Batched read 7 against a recorded 0.5577,
+a gap of ~6.4 nats, far past the `+2.0` tolerance. That is not a false alarm:
+the checkpoint round-trip is genuinely lossy, and the guard saved a 34-hour run
+from training a corrupt model.
+
+**Why this is terminal for the lane.** One epoch is ~51 minutes at ~2.8s/step
+over 1033 batches, and the run is 40 epochs, so it needs roughly **34 GPU-hours
+without interruption**. Colab T4 sessions do not last that long. Every reclaim
+therefore returns to `Epoch 1/40`, and the lane resets forever. It had reached
+step 970/1033 before this reset; that work is gone.
+
+**Two cosmetic things that make the log misleading**, worth fixing when the real
+bug is:
+- the failure message prints `probe_loss` (7.75525) but the DECISION used
+  `probe_decision` (the batched value). Reading the message alone suggests the
+  single-sequence path was the judge, which is exactly the confusion the comment
+  above it was written to prevent.
+- default ostream precision renders the summary as `measured=8 batched=7
+  checkpoint-recorded=0.6`, so all three look like integers-ish and the real
+  gap is hard to read. `std::setprecision` on that line would help.
+
+**Before relaunching this lane, one of:**
+1. fix the checkpoint save/load fidelity (this is the real bug, and it is the
+   same disease class as Finding 4 and the GGUF alignment-padding bug: a
+   serialisation path that silently disagrees with the training path);
+2. or reduce the run so one epoch-set fits inside a session and treat each
+   session as a completed unit;
+3. or set `TCPP_FORCE_RESUME` **only** after proving the restore is faithful.
+   Do NOT set it to make the lane "work" — it would train the corrupt model the
+   guard just caught.
+
+Until then the lane burns a T4 slot for a result that cannot arrive.

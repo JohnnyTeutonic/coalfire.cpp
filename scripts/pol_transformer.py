@@ -10,7 +10,7 @@ it didn't actually compute) is caught, having done O(challenges) verifier work
 rather than re-running the whole chain.
 
 Each transition is
-  train_wikitext --resume S_{k-1} --max-steps 1 --pol-save dir_k
+  train --resume S_{k-1} --max-steps 1 --pol-save dir_k
 with TCPP_SEED=BASE+k, single-thread -- reproducible by gate-1 determinism
 (include/rng_seed.hpp). This is the demonstration in src/pol_demo.cpp, now on
 the actual model.
@@ -18,7 +18,7 @@ the actual model.
 import json, os, random, shutil, struct, subprocess, sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TRAINER = f"{REPO}/build_wsl/train_wikitext"
+TRAINER = f"{REPO}/build_wsl/train"
 DATA = os.environ.get("POL_DATA", "/tmp/tinychat-txt")
 S0 = os.environ.get("POL_S0",
                     "/mnt/c/ml_artifacts/transformer_cpp/colab_out_chat8b/latest_tcpp.ckpt")

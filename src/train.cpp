@@ -118,6 +118,26 @@ struct TrainingConfig {
     bool cosine_decay = false;   // Cosine LR decay to 10% over max_steps (after
                                  // warmup). Constant-LR runs destabilized late
                                  // (2026-07-13: loss 3.4 -> 5.3 in epoch 2).
+    // Early stopping on validation loss (2026-07-30: the transformer_config
+    // early_stopping block was parsed but consumed only by the dead main.cpp
+    // trainer; this wires it into the live loop). patience = number of
+    // consecutive evals without val-loss improving by at least min_delta
+    // before training stops; 0 disables. --config json's early_stopping
+    // {patience, threshold} seeds these when the CLI does not set them.
+    size_t early_stop_patience = 0;
+    float early_stop_min_delta = 0.0f;
+    // Optimizer knobs (2026-07-31): threaded to the in-module Adam updates
+    // via transformer_runtime::adam_beta{1,2}; weight decay rides the
+    // existing config.weight_decay path in Transformer::update_parameters.
+    // Negative = unset (config JSON / defaults win).
+    float beta1 = -1.0f;
+    float beta2 = -1.0f;
+    float weight_decay = -1.0f;
+    // Label smoothing (0 = off): targets become (1-eps)*onehot + eps/V.
+    // CPU loss path only; the CUDA grad kernel fails loudly if requested
+    // (the SWA lesson: never let a knob silently mean different math on
+    // different devices).
+    float label_smoothing = 0.0f;
 };
 
 // Warmup + optional cosine decay. Peak = config LR; floor = 10% of peak.
@@ -334,6 +354,7 @@ TrainingMetrics train(
 ) {
     size_t global_step = start_step;
     float best_val_loss = std::numeric_limits<float>::max();
+    bool early_stop_triggered = false;
     float final_train_loss = 0.0f;
     
     // Open training log file (separate from Logger to keep console output)
@@ -607,18 +628,29 @@ TrainingMetrics train(
                 for (size_t v = 0; v < vocab_size; ++v) {
                     max_logit = std::max(max_logit, output.logits(pos, v));
                 }
-                float sum_exp = 0.0f;
+                float sum_exp = 0.0f, sum_logits = 0.0f;
                 for (size_t v = 0; v < vocab_size; ++v) {
                     float exp_v = std::exp(output.logits(pos, v) - max_logit);
                     sum_exp += exp_v;
+                    sum_logits += output.logits(pos, v);
                 }
+                // Label smoothing: target dist = (1-eps)*onehot + eps/V.
+                // grad = softmax - target; loss = -sum target*log p, whose
+                // uniform part reduces to the closed form below (no extra
+                // vocab pass).
+                const float eps_ls = config.label_smoothing;
+                const float uni = eps_ls / static_cast<float>(vocab_size);
                 for (size_t v = 0; v < vocab_size; ++v) {
                     float softmax_v = std::exp(output.logits(pos, v) - max_logit) / sum_exp;
-                    float target_v = (static_cast<int>(v) == target_token) ? 1.0f : 0.0f;
+                    float target_v = ((static_cast<int>(v) == target_token)
+                                          ? (1.0f - eps_ls) : 0.0f) + uni;
                     grad_logits(pos, v) = softmax_v - target_v;
                 }
-                float log_prob = output.logits(pos, target_token) - max_logit - std::log(sum_exp + 1e-10f);
-                batch_loss += -log_prob;
+                float log_z = max_logit + std::log(sum_exp + 1e-10f);
+                float nll_target = -(output.logits(pos, target_token) - log_z);
+                float nll_uniform_sum =
+                    static_cast<float>(vocab_size) * log_z - sum_logits;
+                batch_loss += (1.0f - eps_ls) * nll_target + uni * nll_uniform_sum;
             }
             avg_loss = loss_count > 0 ? batch_loss / loss_count : 0.0f;
             
@@ -792,6 +824,25 @@ TrainingMetrics train(
                 std::cout << "Val Loss: " << std::fixed << std::setprecision(4) << val_loss
                           << " | Val Perplexity: " << std::setprecision(2) << val_perplexity;
                 
+                // Early stopping bookkeeping: an eval "improves" only if it
+                // beats the best by min_delta; patience counts consecutive
+                // non-improving evals. (static: this block sits inside the
+                // epoch/batch loops; the counter must persist across evals.)
+                static size_t evals_without_improvement = 0;
+                if (config.early_stop_patience > 0) {
+                    if (val_loss < best_val_loss - config.early_stop_min_delta) {
+                        evals_without_improvement = 0;
+                    } else {
+                        ++evals_without_improvement;
+                        std::cout << " [no improvement "
+                                  << evals_without_improvement << "/"
+                                  << config.early_stop_patience << "]";
+                        if (evals_without_improvement >= config.early_stop_patience) {
+                            early_stop_triggered = true;
+                        }
+                    }
+                }
+
                 if (val_loss < best_val_loss) {
                     best_val_loss = val_loss;
                     std::cout << " [NEW BEST!]";
@@ -818,8 +869,24 @@ TrainingMetrics train(
                     }
                 }
                 std::cout << "\n" << std::endl;
-                
+
                 transformer.set_training(true);
+
+                if (early_stop_triggered) {
+                    std::cout << "[EARLY STOP] no val improvement >= "
+                              << config.early_stop_min_delta << " for "
+                              << config.early_stop_patience
+                              << " consecutive evals (best "
+                              << std::setprecision(4) << best_val_loss
+                              << "); stopping at step " << global_step
+                              << std::endl;
+                    if (train_log.is_open()) {
+                        train_log << "[EARLY STOP] at step " << global_step
+                                  << " best_val_loss " << best_val_loss
+                                  << std::endl;
+                    }
+                    stop_training = true;   // same exit plumbing as --max-steps
+                }
             }
             
             // Save checkpoint periodically
@@ -1045,6 +1112,18 @@ int main(int argc, char** argv) {
                 train_config.batch_size = std::stoul(argv[++i]);
             } else if (arg == "--lr" && i + 1 < argc) {
                 train_config.learning_rate = std::stof(argv[++i]);
+            } else if (arg == "--beta1" && i + 1 < argc) {
+                train_config.beta1 = std::stof(argv[++i]);
+            } else if (arg == "--beta2" && i + 1 < argc) {
+                train_config.beta2 = std::stof(argv[++i]);
+            } else if (arg == "--weight-decay" && i + 1 < argc) {
+                train_config.weight_decay = std::stof(argv[++i]);
+            } else if (arg == "--label-smoothing" && i + 1 < argc) {
+                train_config.label_smoothing = std::stof(argv[++i]);
+            } else if (arg == "--early-stop-patience" && i + 1 < argc) {
+                train_config.early_stop_patience = std::stoul(argv[++i]);
+            } else if (arg == "--early-stop-min-delta" && i + 1 < argc) {
+                train_config.early_stop_min_delta = std::stof(argv[++i]);
             } else if (arg == "--cosine-decay") {
                 train_config.cosine_decay = true;
             } else if (arg == "--help" || arg == "-h") {
@@ -1189,9 +1268,43 @@ int main(int argc, char** argv) {
         if (!train_config.config_json.empty()) {
             std::cout << "Loading config overlay: " << train_config.config_json << std::endl;
             model_config.load_from_json(train_config.config_json);
+            // Bridge the JSON early_stopping block into the live trainer:
+            // the CLI wins when explicitly set, otherwise the config file
+            // seeds it (patience 0 stays disabled either way).
+            if (train_config.early_stop_patience == 0 &&
+                model_config.early_stopping_patience > 0) {
+                train_config.early_stop_patience = model_config.early_stopping_patience;
+                train_config.early_stop_min_delta = model_config.early_stopping_threshold;
+                std::cout << "Early stopping (from config): patience "
+                          << train_config.early_stop_patience
+                          << ", min_delta " << train_config.early_stop_min_delta
+                          << std::endl;
+            }
         }
         // Bias freezing must be set BEFORE model construction.
         transformer_runtime::llama_no_bias = !model_config.use_biases;
+        // Optimizer knobs: CLI wins, else config JSON, else defaults. Set
+        // BEFORE model construction (lm_head snapshots betas in its ctor).
+        if (train_config.beta1 >= 0.0f) model_config.beta1 = train_config.beta1;
+        if (train_config.beta2 >= 0.0f) model_config.beta2 = train_config.beta2;
+        if (train_config.weight_decay >= 0.0f)
+            model_config.weight_decay = train_config.weight_decay;
+        transformer_runtime::adam_beta1 = model_config.beta1;
+        transformer_runtime::adam_beta2 = model_config.beta2;
+#ifdef USE_CUDA
+        if (train_config.label_smoothing > 0.0f) {
+            throw std::runtime_error(
+                "--label-smoothing is CPU-path only for now: the CUDA loss "
+                "kernel computes grad_logits without the smoothed target "
+                "(extend loss_kernels.cu before allowing it)");
+        }
+#endif
+        if (train_config.label_smoothing > 0.0f)
+            std::cout << "Label smoothing: " << train_config.label_smoothing
+                      << std::endl;
+        std::cout << "Optimizer: beta1 " << model_config.beta1 << ", beta2 "
+                  << model_config.beta2 << ", weight_decay "
+                  << model_config.weight_decay << std::endl;
         std::cout << "Architecture: " << spec.describe()
                   << (train_config.config_json.empty() ? "" : " (+ config overlay)")
                   << std::endl;

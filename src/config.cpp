@@ -7,6 +7,8 @@
 
 namespace transformer_runtime {
 bool llama_no_bias = false;
+float adam_beta1 = 0.9f;
+float adam_beta2 = 0.999f;
 }
 
 TransformerConfig::TransformerConfig(size_t max_seq_length_, size_t hidden_size_,

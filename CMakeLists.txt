@@ -16,7 +16,7 @@ if(CUDA_ENABLED)
     # Also set for C++ compiler to allow CUDA headers in .cpp files
     if(MSVC)
         # Force-include compatibility header before anything else
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FI\"${CMAKE_SOURCE_DIR}/include/cuda_compat.h\"" CACHE STRING "C++ compiler flags" FORCE)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FI\"${CMAKE_CURRENT_SOURCE_DIR}/include/cuda_compat.h\"" CACHE STRING "C++ compiler flags" FORCE)
         # Add compile definitions to disable CUDA host compiler check
         add_compile_definitions(__NV_NO_HOST_COMPILER_CHECK _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH USE_CUDA CUDA_AVAILABLE)
     endif()
@@ -77,8 +77,8 @@ FetchContent_MakeAvailable(json)
 
 # Include directories
 include_directories(
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
 # Core source files (COMPLETE BUILD)
@@ -169,8 +169,8 @@ add_library(transformer_core STATIC ${CORE_SOURCES})
 
 target_include_directories(transformer_core 
     PUBLIC
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
 target_link_libraries(transformer_core 
@@ -241,26 +241,33 @@ if(CUDA_ENABLED)
 endif()
 
 # Main executable commented out - depends on PyTorch
-# add_executable(transformer_minimal src/main.cpp)
-# target_link_libraries(transformer_minimal PRIVATE transformer_core)
+# (transformer_minimal / src/main.cpp deleted 2026-07-31: dead code that
+# referenced a config shape which no longer exists; `train` is the trainer.)
 
 # Simple training test executable (CPU-only, production ready)
 add_executable(train_simple src/train_simple.cpp)
 target_link_libraries(train_simple PRIVATE transformer_core)
-target_include_directories(train_simple PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(train_simple PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# WikiText training executable (full training on WikiText-103)
-add_executable(train_wikitext src/train_wikitext.cpp)
-target_link_libraries(train_wikitext PRIVATE transformer_core)
-target_include_directories(train_wikitext PRIVATE ${CMAKE_SOURCE_DIR}/include)
+# THE central trainer (TinyStories, WikiText, chat/instruct — word-level
+# corpora generally; renamed from train_wikitext 2026-07-31 to reflect that).
+# SWA deterministic receipt: perturbation probes proving the sliding
+# window binds in forward_batched and combines with causality.
+add_executable(swa_check src/swa_check.cpp)
+target_link_libraries(swa_check PRIVATE transformer_core)
+target_include_directories(swa_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+add_executable(train src/train.cpp)
+target_link_libraries(train PRIVATE transformer_core)
+target_include_directories(train PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_executable(golden_batch_test src/golden_batch_test.cpp)
 target_link_libraries(golden_batch_test PRIVATE transformer_core)
-target_include_directories(golden_batch_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(golden_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 add_executable(matmul_selftest src/matmul_selftest.cpp)
 target_link_libraries(matmul_selftest PRIVATE transformer_core)
-target_include_directories(matmul_selftest PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(matmul_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 # Gate-2 brick: order-invariant (reproducible) summation. Standalone, no deps.
 add_executable(repro_sum_demo src/repro_sum_demo.cpp)

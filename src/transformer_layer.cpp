@@ -30,7 +30,22 @@ TransformerLayer::TransformerLayer(const TransformerConfig& config_, size_t idx)
     // (Decoupled from the legacy llama_mode flag by arch::ArchitectureSpec.)
     attention_ln = std::make_unique<LayerNorm>(config.hidden_size, config.layer_norm_epsilon,
                                                config.use_rms_norm);
-    feed_forward = std::make_unique<FeedForward>(config.hidden_size, config.intermediate_size);
+    // FFN sublayer: dense FeedForward, or MixtureOfExperts when the config
+    // enables it. Everything downstream already branched on moe_layer
+    // (backward in transformer.cpp:131, update_parameters/save/load in
+    // transformer.hpp) -- construction and the forward call sites were the
+    // only missing wires (found + closed 2026-07-31).
+    if (config.moe.enabled) {
+        std::cout << "- MoE: " << config.moe.num_experts << " experts, top-"
+                  << config.moe.top_k << ", aux "
+                  << config.moe.aux_loss_coefficient << std::endl;
+        moe_layer = std::make_unique<MixtureOfExperts>(
+            config.moe.num_experts, config.moe.top_k, config.hidden_size,
+            config.intermediate_size, config.moe.aux_loss_coefficient);
+    } else {
+        feed_forward = std::make_unique<FeedForward>(config.hidden_size,
+                                                     config.intermediate_size);
+    }
     ffn_ln = std::make_unique<LayerNorm>(config.hidden_size, config.layer_norm_epsilon,
                                          config.use_rms_norm);
 
@@ -68,7 +83,8 @@ Matrix TransformerLayer::forward(const Matrix& input, const AttentionMask& mask,
     std::string ffn_key = "ffn_norm_" + std::to_string(layer_idx);
     GradientCheckpoint::cache_activation(ffn_key, ffn_normalized);
     
-    Matrix ffn_output = feed_forward->forward(ffn_normalized);
+    Matrix ffn_output = moe_layer ? moe_layer->forward(ffn_normalized)
+                                  : feed_forward->forward(ffn_normalized);
     if (training) {
         ffn_output = ffn_dropout->forward(ffn_output);
     }
@@ -113,7 +129,8 @@ Matrix TransformerLayer::forward_batched(const Matrix& input, const AttentionMas
     GradientCheckpoint::cache_activation(ffn_key, ffn_normalized);
     auto lt3 = std::chrono::high_resolution_clock::now();
 
-    Matrix ffn_output = feed_forward->forward(ffn_normalized);
+    Matrix ffn_output = moe_layer ? moe_layer->forward(ffn_normalized)
+                                  : feed_forward->forward(ffn_normalized);
     if (training) {
         ffn_output = ffn_dropout->forward(ffn_output);
     }

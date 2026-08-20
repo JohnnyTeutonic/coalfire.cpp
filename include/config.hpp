@@ -68,6 +68,15 @@ namespace transformer_runtime {
 // consult this to keep biases frozen at zero, so the exported GGUF (which
 // carries no bias tensors) reproduces training math exactly.
 extern bool llama_no_bias;
+
+// Adam moment coefficients, set once at startup from config/CLI. Four
+// modules (embeddings, lm_head, feed_forward, attention) run their own
+// in-module Adam updates and hardcoded 0.9/0.999 until 2026-07-31; they
+// now read these. The same runtime-global pattern as llama_no_bias --
+// threading through every update_parameters signature was the churn this
+// avoids.
+extern float adam_beta1;
+extern float adam_beta2;
 }
 
 struct TransformerConfig {
@@ -89,9 +98,11 @@ struct TransformerConfig {
     float dropout_rate = 0.1f;
     float weight_decay = 0.0f;  // Default to 0 - no weight decay
     
-    // Early stopping parameters
-    size_t early_stopping_patience;
-    float early_stopping_threshold;
+    // Early stopping parameters (0 = disabled; consumed by train_wikitext's
+    // validation loop as of 2026-07-30 — previously parsed but only ever
+    // read by the dead main.cpp trainer)
+    size_t early_stopping_patience = 0;
+    float early_stopping_threshold = 0.0f;
     
     // Cross validation parameters
     size_t num_folds = 5;

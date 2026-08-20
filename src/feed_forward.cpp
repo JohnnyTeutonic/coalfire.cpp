@@ -312,8 +312,8 @@ void FeedForward::update_parameters(float learning_rate) {
     SCOPE_LOG();
     
     // Adam (matches the LM head's optimizer; see attention.cpp note)
-    const float beta = 0.9f;
-    const float beta2 = 0.999f;
+    const float beta = transformer_runtime::adam_beta1;
+    const float beta2 = transformer_runtime::adam_beta2;
     const float adam_eps = 1e-8f;
     const float clip_threshold = 1.0f;
 

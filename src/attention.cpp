@@ -535,6 +535,16 @@ Matrix MultiHeadAttention::forward_batched(const Matrix& input, const AttentionM
     cached_attention_weights = Matrix(batch_size * num_heads * seq_len, seq_len);
     
 #ifdef USE_CUDA
+    // The CUDA batched kernel implements causal masking only; running a
+    // sliding-window model through it would silently train full-attention
+    // (the exact defect just fixed on the CPU path). Fail loudly until the
+    // kernel gains the window term.
+    if (use_sliding_window) {
+        throw std::runtime_error(
+            "sliding-window attention is not implemented in the CUDA "
+            "batched path (2026-07-31); use the CPU build or extend "
+            "batched_attention_forward");
+    }
     // Call CUDA batched attention.
     // RESOLVED (2026-07-23): the previously-suspected CUDA-vs-CPU forward
     // divergence was not real — it was a test harness reconstructing the
@@ -570,7 +580,19 @@ Matrix MultiHeadAttention::forward_batched(const Matrix& input, const AttentionM
                         sum += Q(batch_offset + i, head_offset + k) * K(batch_offset + j, head_offset + k);
                     }
                     size_t cache_idx = (b * num_heads + h) * seq_len + i;
-                    cached_attention_weights(cache_idx, j) = (j > i) ? -1e30f : sum * scale;
+                    // Causal AND sliding-window mask. The window uses the
+                    // same half-window semantics as the single-sequence
+                    // path (attention.cpp:1306) so train and infer agree;
+                    // combined with causality the visible span is
+                    // [i - window_size/2, i]. Before 2026-07-31 the window
+                    // was NOT applied here at all -- the swa_check probe
+                    // showed far-outside-window perturbations leaking into
+                    // the training path (STUDIO_PLAN section 12).
+                    const bool masked_out =
+                        (j > i) ||
+                        (use_sliding_window && (i - j) > window_size / 2);
+                    cached_attention_weights(cache_idx, j) =
+                        masked_out ? -1e30f : sum * scale;
                 }
             }
             
@@ -1607,8 +1629,8 @@ void MultiHeadAttention::update_parameters(float learning_rate) {
     
     // Adam (matches the LM head's optimizer; SGD-momentum at Adam-scale LRs
     // left these weights near init — the 2026-07-13 loss-6.0 plateau).
-    const float beta = 0.9f;
-    const float beta2 = 0.999f;
+    const float beta = transformer_runtime::adam_beta1;
+    const float beta2 = transformer_runtime::adam_beta2;
     const float adam_eps = 1e-8f;
     const float clip_threshold = 1.0f;
 

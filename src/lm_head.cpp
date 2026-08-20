@@ -1,4 +1,5 @@
 #include "../include/lm_head.hpp"
+#include "../include/config.hpp"
 #include "../include/lora.hpp"
 #include "../include/token_constants.hpp"
 #include "../include/cuda/matrix_ops.cuh"  // Add CUDA matrix operations header
@@ -37,8 +38,8 @@ LanguageModelHead::LanguageModelHead(size_t hidden_size, size_t vocab_size)
       m_bias(vocab_size, 0.0f),
       v_bias(vocab_size, 0.0f),
       t(0),
-      beta1(0.9f),
-      beta2(0.999f),
+      beta1(transformer_runtime::adam_beta1),
+      beta2(transformer_runtime::adam_beta2),
       eps(1e-8f),
       current_lr(0.001f),
       min_lr(0.0001f),

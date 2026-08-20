@@ -5,7 +5,7 @@ uploaded via the colab CLI). Then:
   1. unzip source -> /content/tcpp
   2. cmake -DCUDA_ENABLED=ON (CMAKE_CUDA_ARCHITECTURES=native detects T4/A100/L4)
   3. prepare TinyStories text files (datasets lib)
-  4. run train_wikitext with the requested steps/export format
+  4. run train with the requested steps/export format
 
 Usage on the VM (via `colab exec -f` or a notebook cell):
     python colab_train_tinystories.py [--steps 5000] [--export both]
@@ -66,7 +66,7 @@ sh(f"cd /content && unzip -oq transformer_cpp_src.zip -d {ROOT}")
 # Build (native arch: nvcc detects the attached GPU — T4=75, A100=80, L4=89)
 sh(f"cd {ROOT} && cmake -B build -DCUDA_ENABLED=ON -DCMAKE_BUILD_TYPE=Release "
    f"-DCMAKE_CUDA_ARCHITECTURES=native")
-sh(f"cd {ROOT} && cmake --build build --target train_wikitext --parallel $(nproc)")
+sh(f"cd {ROOT} && cmake --build build --target train --parallel $(nproc)")
 
 # Data
 sh("pip install -q datasets")
@@ -107,7 +107,7 @@ if a.export in ("gguf", "both"):
     exports.append("--export-gguf model.gguf")
 if a.export in ("safetensors", "both"):
     exports.append("--export-safetensors model.safetensors")
-sh(f"cd {run_dir} && ../build/train_wikitext ../{data_dir} "
+sh(f"cd {run_dir} && ../build/train ../{data_dir} "
    f"--epochs {a.epochs} --max-steps {a.steps} --batch-size {a.batch_size} "
    + (f"--lr {a.lr} " if a.lr else "")
    + ("--cosine-decay " if a.cosine_decay else "")

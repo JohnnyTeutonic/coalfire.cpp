@@ -255,7 +255,7 @@ def main():
     write("train-0-small.txt", train[:args.small_rows])
     write("train-1-small.txt", train[args.small_rows:2 * args.small_rows])
     write("validation.txt", val)
-    print(f"done -> {out}  (train with: train_wikitext ../{out})")
+    print(f"done -> {out}  (train with: train ../{out})")
 
 
 if __name__ == "__main__":

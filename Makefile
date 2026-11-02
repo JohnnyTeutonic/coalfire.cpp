@@ -52,8 +52,8 @@ release:
 # Documentation targets
 .PHONY: docs
 docs:
-	@mkdir -p $(BUILD_DIR)
-	@cd $(BUILD_DIR) && cmake --build . --target docs
+	@mkdir -p $(DOCS_DIR)
+	doxygen Doxyfile
 
 .PHONY: docs-clean
 docs-clean:

@@ -1,0 +1,27 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  gguf:
+    # The GGUF writer on its own, and export_to_gguf's files against their
+    # recorded SHA-256s (tests/gguf_export_test.cpp). CPU build.
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure (CPU)
+      run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+    - name: Build the GGUF tests
+      run: cmake --build build --target gguf_writer_test gguf_export_test -j "$(nproc)"
+
+    - name: Run
+      run: cd build && ctest --output-on-failure

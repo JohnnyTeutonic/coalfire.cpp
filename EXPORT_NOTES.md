@@ -17,7 +17,9 @@ Three independent defects:
    tensor shifted by `align_up(header_end,32) − header_end` bytes (11 bytes
    for the 2026-07-12 model). Result: garbage weights → NaN logits → the
    sampler's top-k selected a fixed arbitrary set of tied candidates.
-   Fixed in `GGUFWriter::finalize()`; `general.alignment=32` is now written
+   Fixed in `GGUFWriter::finalize()` (the shared writer
+   `include/gguf_writer.hpp` since 3 Nov 2026; `tests/gguf_writer_test.cpp`
+   checks the padding); `general.alignment=32` is now written
    explicitly.
 
 2. **Special-token ids (`gguf_export.cpp`).** The word-level vocab layout is

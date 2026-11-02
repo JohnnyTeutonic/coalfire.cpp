@@ -14,35 +14,14 @@ permissions:
 jobs:
   build-docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install dependencies
+    - name: Install Doxygen
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
-          doxygen \
-          graphviz \
-          cmake \
-          build-essential \
-          nvidia-cuda-dev \
-          nvidia-cuda-toolkit \
-          ninja-build \
-          nlohmann-json3-dev \
-          libomp-dev \
-          libopenblas-dev \
-          liblapack-dev \
-          pkg-config \
-          g++ \
-          gcc
-
-    - name: Configure CMake
-      run: |
-        mkdir -p build
-        cmake -B build \
-          -DCMAKE_CXX_COMPILER=$(which g++) \
-          -DCMAKE_C_COMPILER=$(which gcc) \
-          -DUSE_CUDA=OFF
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends doxygen graphviz
 
     - name: Generate documentation
       run: |

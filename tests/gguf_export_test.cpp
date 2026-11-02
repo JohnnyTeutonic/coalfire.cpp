@@ -9,12 +9,21 @@
 // the bytes it was. A mismatch is a change in what coalfire writes: fix the
 // writer, never the table, unless the format change is the intended one.
 //
+// Two export contracts are checked on top (3 Nov 2026). A model configured
+// with attention: gqa is still full multi-head attention, so its export is
+// llama_default's file and declares head_count_kv = head_count. And
+// tie_word_embeddings, which omits the trained head, is refused (nothing
+// written) unless the head is exactly the transposed embedding with a zero
+// bias; the tied cases' models have such a head, so their files are the
+// bytes they always were. The safetensors and HF exporters share that guard.
+//
 //   gguf_export_test          check every case
 //   gguf_export_test --print  print "name sha256" for every case
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -30,6 +39,7 @@
 #include "gguf_export.hpp"
 #include "layer_norm.hpp"
 #include "lm_head.hpp"
+#include "safetensors_export.hpp"
 #include "tiktoken_tokenizer.hpp"
 #include "transformer.hpp"
 
@@ -127,8 +137,10 @@ std::shared_ptr<TiktokenTokenizer> vocab(const std::string& path, const std::vec
     return tok;
 }
 
+// gqa_kv_heads > 0 asks for attention: gqa with that many KV heads, which
+// coalfire does not implement (the model is still full multi-head attention).
 std::unique_ptr<Transformer> model(const std::string& family, std::shared_ptr<TiktokenTokenizer> tok,
-                                   uint32_t seed) {
+                                   uint32_t seed, size_t gqa_kv_heads = 0) {
     TransformerConfig cfg;
     cfg.hidden_size = 8;
     cfg.num_heads = 2;
@@ -141,6 +153,10 @@ std::unique_ptr<Transformer> model(const std::string& family, std::shared_ptr<Ti
     cfg.use_gqa = false;
     cfg.num_kv_heads = cfg.num_heads;
     arch::ArchitectureSpec spec = arch::ArchitectureSpec::from_family(family);
+    if (gqa_kv_heads > 0) {
+        spec.attention = arch::Attention::GQA;
+        spec.num_kv_heads = gqa_kv_heads;
+    }
     spec.validate();
     spec.apply(cfg);
     transformer_runtime::llama_no_bias = !cfg.use_biases;
@@ -166,6 +182,41 @@ std::unique_ptr<Transformer> model(const std::string& family, std::shared_ptr<Ti
     return t;
 }
 
+// Make the head exactly the transposed token embedding with a zero bias, so
+// that tie_word_embeddings is lossless. A tied export omits the head, so its
+// bytes are those of the same model with its own head.
+void tie_head(Transformer& t) {
+    const Matrix& e = t.getTokenEmbedding()->getWeights();
+    Matrix& w = t.get_lm_head()->get_weights();
+    for (size_t h = 0; h < w.rows(); ++h)
+        for (size_t v = 0; v < w.cols(); ++v) w(h, v) = e(v, h);
+    Vector& b = t.get_lm_head()->get_bias();
+    for (size_t i = 0; i < b.size(); ++i) b[i] = 0.0f;
+}
+
+// The UINT32 value of a top-level GGUF metadata key, or -1 when absent.
+int64_t gguf_u32(const std::string& path, const std::string& key) {
+    std::ifstream f(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    const std::string buf = ss.str();
+    std::string needle(8, '\0');
+    const uint64_t n = key.size();
+    std::memcpy(&needle[0], &n, 8);
+    needle += key;
+    const size_t p = buf.find(needle);
+    if (p == std::string::npos || p + needle.size() + 8 > buf.size()) return -1;
+    uint32_t type = 0, value = 0;
+    std::memcpy(&type, buf.data() + p + needle.size(), 4);
+    std::memcpy(&value, buf.data() + p + needle.size() + 4, 4);
+    return type == 4 ? static_cast<int64_t>(value) : -1;
+}
+
+bool path_exists(const std::string& path) {
+    std::error_code ec;
+    return std::filesystem::exists(path, ec);
+}
+
 // The recorded SHA-256 of every case (see the header comment). "refused":
 // export_to_gguf must return false and write nothing.
 const std::map<std::string, std::string> kWant = {
@@ -182,6 +233,14 @@ const std::map<std::string, std::string> kWant = {
     {"llama_weight_bf16", "refused"},
     {"llama_weight_q8_0", "refused"},
     {"llama_weight_q4_0", "refused"},
+    // attention: gqa is not implemented, so the model is llama_default's (same
+    // seed) and so is its file: head_count_kv is the head count, 2.
+    {"llama_gqa_config", "618d57cb9147d003be9b0236886d527631bb714f2facea51295eaffd76901edf"},
+    // tie_word_embeddings would drop a trained head that is not the embedding.
+    {"llama_tied_untied_head", "refused"},
+    {"vanilla_tied_untied_head", "refused"},
+    {"llama_tied_one_weight_differs", "refused"},
+    {"llama_tied_head_bias", "refused"},
 };
 
 }  // namespace
@@ -206,6 +265,23 @@ int main(int argc, char** argv) {
 
     auto llama = model("llama", tok, 100);
     auto vanilla = model("vanilla", tok, 200);  // LayerNorm, no RoPE: no rope.* keys
+    // The same models with the head set to the transposed embedding: the tied
+    // cases' files are what they were before the exporter refused untied heads.
+    auto llama_tied = model("llama", tok, 100);
+    tie_head(*llama_tied);
+    auto vanilla_tied = model("vanilla", tok, 200);
+    tie_head(*vanilla_tied);
+    auto llama_tied_off = model("llama", tok, 100);  // tied but for one head weight
+    tie_head(*llama_tied_off);
+    llama_tied_off->get_lm_head()->get_weights()(3, 5) += 0.125f;
+    auto llama_tied_bias = model("llama", tok, 100);  // tied weights, non-zero bias
+    tie_head(*llama_tied_bias);
+    llama_tied_bias->get_lm_head()->get_bias()[4] = 0.25f;
+    auto llama_gqa = model("llama", tok, 100, 1);  // attention: gqa, num_kv_heads 1
+    if (llama_gqa->getConfig().num_kv_heads != 1 || !llama_gqa->getConfig().use_gqa) {
+        std::printf("[FAIL] the gqa fixture's config is not attention: gqa with 1 KV head\n");
+        return 1;
+    }
 
     using Cfg = gguf_export::GGUFExportConfig;
     struct Case {
@@ -217,7 +293,7 @@ int main(int argc, char** argv) {
     std::vector<Case> cases = {
         {"llama_default", llama.get(), tok.get(), [](Cfg&) {}},
         {"llama_no_tokenizer", llama.get(), tok.get(), [](Cfg& c) { c.include_tokenizer = false; }},
-        {"llama_tied", llama.get(), tok.get(), [](Cfg& c) { c.tie_word_embeddings = true; }},
+        {"llama_tied", llama_tied.get(), tok.get(), [](Cfg& c) { c.tie_word_embeddings = true; }},
         {"llama_name_arch", llama.get(), tok.get(),
          [](Cfg& c) {
              c.model_name = "transformer_cpp_wikitext";
@@ -226,7 +302,7 @@ int main(int argc, char** argv) {
         {"llama_eos_endoftext", llama.get(), tok_eos.get(), [](Cfg&) {}},
         {"llama_tokenizer_larger_than_model", llama.get(), tok_big.get(), [](Cfg&) {}},
         {"vanilla_no_rope", vanilla.get(), tok.get(), [](Cfg&) {}},
-        {"vanilla_tied_no_tokenizer", vanilla.get(), tok.get(),
+        {"vanilla_tied_no_tokenizer", vanilla_tied.get(), tok.get(),
          [](Cfg& c) {
              c.tie_word_embeddings = true;
              c.include_tokenizer = false;
@@ -238,6 +314,16 @@ int main(int argc, char** argv) {
         {"llama_weight_bf16", llama.get(), tok.get(), [](Cfg& c) { c.weight_type = gguf_export::GGMLType::BF16; }},
         {"llama_weight_q8_0", llama.get(), tok.get(), [](Cfg& c) { c.weight_type = gguf_export::GGMLType::Q8_0; }},
         {"llama_weight_q4_0", llama.get(), tok.get(), [](Cfg& c) { c.weight_type = gguf_export::GGMLType::Q4_0; }},
+        {"llama_gqa_config", llama_gqa.get(), tok.get(), [](Cfg&) {}},
+        {"llama_tied_untied_head", llama.get(), tok.get(), [](Cfg& c) { c.tie_word_embeddings = true; }},
+        {"vanilla_tied_untied_head", vanilla.get(), tok.get(),
+         [](Cfg& c) {
+             c.tie_word_embeddings = true;
+             c.include_tokenizer = false;
+         }},
+        {"llama_tied_one_weight_differs", llama_tied_off.get(), tok.get(),
+         [](Cfg& c) { c.tie_word_embeddings = true; }},
+        {"llama_tied_head_bias", llama_tied_bias.get(), tok.get(), [](Cfg& c) { c.tie_word_embeddings = true; }},
     };
 
     int failed = 0;
@@ -270,10 +356,62 @@ int main(int argc, char** argv) {
         std::printf("recorded %zu hashes for %zu cases\n", kWant.size(), cases.size());
         ++failed;
     }
+
+    // head_count_kv of the gqa-config export, read from the file: the head
+    // count, not the requested num_kv_heads.
+    {
+        const std::string path = tmp + "/gguf_export_test_gqa_kv.gguf";
+        std::remove(path.c_str());
+        const bool ok = gguf_export::export_to_gguf(*llama_gqa, *tok, path, Cfg());
+        const int64_t kv = ok ? gguf_u32(path, "llama.attention.head_count_kv") : -2;
+        const int64_t heads = ok ? gguf_u32(path, "llama.attention.head_count") : -2;
+        std::remove(path.c_str());
+        if (kv != 2 || heads != 2) {
+            std::printf("  %-36s head_count %lld, head_count_kv %lld, expected 2 and 2  FAIL\n",
+                        "gqa_config_head_count_kv", static_cast<long long>(heads), static_cast<long long>(kv));
+            ++failed;
+        } else {
+            std::printf("  %-36s ok (head_count_kv 2 = head_count)\n", "gqa_config_head_count_kv");
+        }
+    }
+
+    // The safetensors and HF exporters share the tie guard: refused, writing
+    // nothing, on an untied head; accepted on a head equal to the embedding.
+    {
+        using SCfg = safetensors_export::SafetensorsExportConfig;
+        SCfg tie;
+        tie.tie_word_embeddings = true;
+        const std::string st = tmp + "/gguf_export_test_tied.safetensors";
+        const std::string hf = tmp + "/gguf_export_test_tied_hf";
+        auto clean = [&] {
+            std::remove(st.c_str());
+            std::remove((st + ".vocab.json").c_str());
+            std::error_code ec;
+            std::filesystem::remove_all(hf, ec);
+        };
+        auto check = [&](const char* name, bool cond) {
+            std::printf("  %-36s %s\n", name, cond ? "ok" : "FAIL");
+            if (!cond) ++failed;
+        };
+        clean();
+        bool ok = safetensors_export::export_to_safetensors(*llama, *tok, st, tie);
+        check("safetensors_tied_untied_head", !ok && !path_exists(st) && !path_exists(st + ".vocab.json"));
+        clean();
+        ok = safetensors_export::export_to_hf(*llama, *tok, hf, tie);
+        check("hf_tied_untied_head", !ok && !path_exists(hf));
+        clean();
+        ok = safetensors_export::export_to_safetensors(*llama_tied, *tok, st, tie);
+        check("safetensors_tied_head", ok && path_exists(st));
+        clean();
+        ok = safetensors_export::export_to_hf(*llama_tied, *tok, hf, tie);
+        check("hf_tied_head", ok && path_exists(hf + "/model.safetensors"));
+        clean();
+    }
     if (failed) {
-        std::printf("\n[FAIL] %d GGUF exports differ from their recorded bytes\n", failed);
+        std::printf("\n[FAIL] %d checks failed\n", failed);
         return 1;
     }
-    std::printf("\n[PASS] %zu GGUF exports byte-identical to their recorded hashes\n", cases.size());
+    std::printf("\n[PASS] %zu GGUF exports match their recorded hashes; head_count_kv and the tie guard hold\n",
+                cases.size());
     return 0;
 }

@@ -38,7 +38,7 @@ A pure C++ implementation of transformer training with CUDA acceleration.
 - **Dialogue chat milestone (2026-07-20)** — a 4-layer/256-hidden model (`--mid` preset) trained on synthetic dialogue holds question→answer semantics and serves interactive chat through the engine's web UI, including multi-turn history. The experimental record — what worked, what failed, and why — lives in [CHAT_EXPERIMENTS.md](CHAT_EXPERIMENTS.md).
 - **Core transformer training** — TinyStories / TinyStories-Instruct / dialogue corpora on Colab T4s (WikiText-2 for the original smoke tests); resumable checkpoints (format 3: full-model serialization, payload hashes, atomic writes, restore-fidelity probe at resume).
 - **CUDA kernels** — fused softmax+cross-entropy loss, batched training path; fused attention, SwiGLU, MoE routing (see hygiene notes above for the fused-attention caveat)
-- **Standard optimizations** — FP16 mixed precision, gradient accumulation, RoPE, GQA
+- **Standard optimizations** — FP16 mixed precision, gradient accumulation, RoPE (grouped-query attention is not implemented: an `attention: gqa` config trains full multi-head attention, with a warning)
 
 ## What Exists But Is Not Operational
 
@@ -122,7 +122,7 @@ vs unseen-paraphrase probes with an intent confusion matrix.
 ## Transformer Features
 
 ### Attention
-- Multi-Head Attention with GQA support
+- Multi-Head Attention (GQA is not implemented: `attention: gqa` / `num_kv_heads` are accepted, warned about, and the model keeps one K/V head per query head)
 - Rotary Position Embeddings (RoPE)
 - Flash Attention memory optimization
 - Key-Value Cache

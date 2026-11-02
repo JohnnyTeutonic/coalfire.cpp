@@ -45,6 +45,8 @@ bool export_to_safetensors(
 ) {
     std::cout << "Safetensors Export: Starting export to " << output_path << std::endl;
     if (!export_guard::llama_ffn_biases_zero(transformer, "Safetensors export")) return false;
+    if (!export_guard::tied_head_lossless(transformer, config.tie_word_embeddings, "Safetensors export"))
+        return false;
 
     const auto& model_config = transformer.getConfig();
     std::vector<STTensor> tensors;
@@ -209,6 +211,7 @@ bool export_to_hf(
     const SafetensorsExportConfig& config
 ) {
     if (!export_guard::llama_ffn_biases_zero(transformer, "HF export")) return false;
+    if (!export_guard::tied_head_lossless(transformer, config.tie_word_embeddings, "HF export")) return false;
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::create_directories(out_dir, ec);

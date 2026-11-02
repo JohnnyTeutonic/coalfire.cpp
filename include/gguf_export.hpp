@@ -35,7 +35,11 @@ struct GGUFExportConfig {
     // another type's tag).
     GGMLType weight_type = GGMLType::F32;
     bool include_tokenizer = true;
-    bool tie_word_embeddings = false;  // Whether lm_head shares weights with embeddings
+    // Omit output.weight, so a consumer uses token_embd as the head. A coalfire
+    // model has its own trained head, so export_to_gguf refuses this (writing
+    // nothing) unless the head is exactly the transposed embedding with a zero
+    // bias (export_guard::tied_head_lossless).
+    bool tie_word_embeddings = false;
 };
 
 /**

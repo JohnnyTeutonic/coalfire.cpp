@@ -1020,10 +1020,14 @@ void Transformer::initialize_weights() {
                 init_weights(params.up_proj_weights, config.hidden_size, config.intermediate_size);
                 init_weights(params.down_proj_weights, config.intermediate_size, config.hidden_size);
                 
-                // Initialize FF biases to small positive values for ReLU
-                params.gate_proj_bias.initialize_constant(0.01f);
-                params.up_proj_bias.initialize_constant(0.01f);
-                params.down_proj_bias.initialize_constant(0.01f);
+                // FF biases: small positive values for ReLU, except in LLaMA mode, where they are exactly zero and
+                // frozen (FeedForward's own initialisation, which this loop used to overwrite with 0.01: the CPU
+                // forward then added a constant bias that the GGUF/HF exports and the CUDA SwiGLU never have;
+                // paperkiln docs/receipts/c2_coalfire_parity_20261103).
+                const float ff_bias = transformer_runtime::llama_no_bias ? 0.0f : 0.01f;
+                params.gate_proj_bias.initialize_constant(ff_bias);
+                params.up_proj_bias.initialize_constant(ff_bias);
+                params.down_proj_bias.initialize_constant(ff_bias);
             }
             
             // Initialize layer norm parameters

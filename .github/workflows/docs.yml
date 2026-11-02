@@ -6,77 +6,27 @@ on:
   pull_request:
     branches: [ main ]
 
+# A build check only. The site itself is served by GitHub Pages from main's /docs folder (legacy
+# branch deployment), so this workflow does not deploy.
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: read
 
-concurrency:
-    group: "pages"
-    cancel-in-progress: true
-  
 jobs:
   build-docs:
-    environment:
-        name: github-pages
-        url: ${{ steps.deployment.outputs.page_url }}  
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install dependencies
+    - name: Install Doxygen
       run: |
         sudo apt-get update
-        sudo apt-get install -y \
-          doxygen \
-          graphviz \
-          cmake \
-          build-essential \
-          nvidia-cuda-dev \
-          nvidia-cuda-toolkit \
-          ninja-build \
-          nlohmann-json3-dev \
-          libomp-dev \
-          libopenblas-dev \
-          liblapack-dev \
-          pkg-config \
-          g++ \
-          gcc
-
-    - name: Configure CMake
-      run: |
-        mkdir -p build
-        cmake -B build \
-          -DCMAKE_CXX_COMPILER=$(which g++) \
-          -DCMAKE_C_COMPILER=$(which gcc) \
-          -DUSE_CUDA=OFF
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends doxygen graphviz
 
     - name: Generate documentation
       run: |
         make docs-clean
         make docs
-
-    - name: Setup Pages
-      uses: actions/configure-pages@v5
-      
-    - name: Create gh-pages branch if not exists
-      run: |
-        if ! git show-ref --quiet refs/heads/gh-pages; then
-          git checkout --orphan gh-pages
-          git reset --hard
-          git commit --allow-empty -m "Create gh-pages branch"
-          git push origin gh-pages
-        fi
-        git checkout ${GITHUB_REF##*/}
-          
-    - name: Upload documentation artifact
-      uses: actions/upload-pages-artifact@v3
-      with:
-        path: docs/html/
-    
-    - name: Deploy to GitHub Pages
-      id: deployment
-      uses: actions/deploy-pages@v4
 
     - name: Verify documentation
       run: |

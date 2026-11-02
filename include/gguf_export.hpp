@@ -18,6 +18,9 @@
 // Forward declarations
 class Transformer;
 class TiktokenTokenizer;
+namespace byte_bpe {
+struct GgufTokenizer;
+}
 
 namespace gguf_export {
 
@@ -47,6 +50,31 @@ struct GGUFExportConfig {
 bool export_to_gguf(
     const Transformer& transformer,
     const TiktokenTokenizer& tokenizer,
+    const std::string& output_path,
+    const GGUFExportConfig& config = GGUFExportConfig()
+);
+
+/**
+ * @brief Export a Transformer trained on a byte-level BPE vocabulary
+ *
+ * The same file as the word-level export except the tokenizer block, which
+ * is paperkiln's for a "bpe" vocabulary (its src/gguf.cpp write_tokenizer):
+ * tokenizer.ggml.model "bpe", pre when the vocabulary has one, the tokens,
+ * the merges, add_bos/add_eos false when pre is set, zero scores, and
+ * bos = 1, eos = the id of <|endoftext|> (else 1), unknown = padding = 0.
+ * Refuses a vocabulary whose model is not "bpe", one without merges, and one
+ * whose size is not the model's vocabulary size.
+ *
+ * @param transformer The trained transformer model
+ * @param vocab The vocabulary as read by byte_bpe::read_gguf_tokenizer
+ *              (a tools/bpe.py vocabulary GGUF or a BPE model export)
+ * @param output_path Path for the output .gguf file
+ * @param config Export configuration
+ * @return true if export succeeded
+ */
+bool export_to_gguf(
+    const Transformer& transformer,
+    const byte_bpe::GgufTokenizer& vocab,
     const std::string& output_path,
     const GGUFExportConfig& config = GGUFExportConfig()
 );

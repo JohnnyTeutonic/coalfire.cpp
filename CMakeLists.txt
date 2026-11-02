@@ -282,7 +282,7 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(repro_reduce_demo PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
-# GGUF writer tests (ctest). gguf_writer_test needs only the standalone
+# GGUF writer and tokenizer tests (ctest). gguf_writer_test needs only the standalone
 # header include/gguf_writer.hpp; gguf_export_test checks export_to_gguf's
 # files against their recorded SHA-256s (byte identity, ROADMAP C3). Only
 # when coalfire is the top-level project: paperkiln vendors this tree
@@ -296,6 +296,16 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     target_link_libraries(gguf_export_test PRIVATE transformer_core)
     target_include_directories(gguf_export_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME gguf_export COMMAND gguf_export_test)
+    # Byte-level BPE (ROADMAP C5): the standalone header include/byte_bpe_tokenizer.hpp
+    # against ids recorded from paperkiln's tokenizer, and the BPE GGUF export
+    # against paperkiln's tokenizer block (fixtures in tests/fixtures/bpe/).
+    add_executable(bpe_tokenizer_test tests/bpe_tokenizer_test.cpp)
+    target_include_directories(bpe_tokenizer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME bpe_tokenizer COMMAND bpe_tokenizer_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/bpe)
+    add_executable(bpe_export_test tests/bpe_export_test.cpp)
+    target_link_libraries(bpe_export_test PRIVATE transformer_core)
+    target_include_directories(bpe_export_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME bpe_export COMMAND bpe_export_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/bpe)
 endif()
 
 message(STATUS "")

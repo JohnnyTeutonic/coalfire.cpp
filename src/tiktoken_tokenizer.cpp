@@ -175,6 +175,17 @@ void TiktokenTokenizer::load_vocabulary_from_id_list(const std::string& filepath
     std::cout << "Loaded vocabulary from id list: " << id << " tokens" << std::endl;
 }
 
+void TiktokenTokenizer::load_vocabulary_from_tokens(const std::vector<std::string>& tokens) {
+    word_to_id_.clear();
+    id_to_word_.clear();
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        word_to_id_.emplace(tokens[i], static_cast<int>(i));  // a repeated string keeps its first id
+        id_to_word_[static_cast<int>(i)] = tokens[i];
+    }
+    id_indexed_ = true;
+    initialized_ = true;
+}
+
 std::vector<int> TiktokenTokenizer::encode(const std::string& text) const {
     if (!initialized_) {
         throw std::runtime_error("Tokenizer not initialized");

@@ -4,6 +4,7 @@
  */
 
 #include "../include/gguf_export.hpp"
+#include "../include/export_guard.hpp"
 #include "../include/transformer.hpp"
 #include "../include/tiktoken_tokenizer.hpp"
 #include "../include/attention.hpp"
@@ -88,6 +89,7 @@ bool export_to_gguf(
     const GGUFExportConfig& config
 ) {
     std::cout << "GGUF Export: Starting export to " << output_path << std::endl;
+    if (!export_guard::llama_ffn_biases_zero(transformer, "GGUF export")) return false;
 
     GGUFWriter writer(output_path);
 

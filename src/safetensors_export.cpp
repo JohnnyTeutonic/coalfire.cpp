@@ -6,6 +6,7 @@
  */
 
 #include "../include/safetensors_export.hpp"
+#include "../include/export_guard.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -43,6 +44,7 @@ bool export_to_safetensors(
     const SafetensorsExportConfig& config
 ) {
     std::cout << "Safetensors Export: Starting export to " << output_path << std::endl;
+    if (!export_guard::llama_ffn_biases_zero(transformer, "Safetensors export")) return false;
 
     const auto& model_config = transformer.getConfig();
     std::vector<STTensor> tensors;
@@ -206,6 +208,7 @@ bool export_to_hf(
     const std::string& out_dir,
     const SafetensorsExportConfig& config
 ) {
+    if (!export_guard::llama_ffn_biases_zero(transformer, "HF export")) return false;
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::create_directories(out_dir, ec);

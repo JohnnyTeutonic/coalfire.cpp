@@ -65,8 +65,12 @@ bool export_to_gguf(
  * Refuses a vocabulary whose model is not "bpe", one without merges, and one
  * whose size is not the model's vocabulary size.
  *
+ * @param transformer The trained transformer model
  * @param vocab The vocabulary as read by byte_bpe::read_gguf_tokenizer
  *              (a tools/bpe.py vocabulary GGUF or a BPE model export)
+ * @param output_path Path for the output .gguf file
+ * @param config Export configuration
+ * @return true if export succeeded
  */
 bool export_to_gguf(
     const Transformer& transformer,

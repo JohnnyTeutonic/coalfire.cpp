@@ -7,6 +7,7 @@
 #include "../include/export_guard.hpp"
 #include "../include/transformer.hpp"
 #include "../include/tiktoken_tokenizer.hpp"
+#include "../include/byte_bpe_tokenizer.hpp"
 #include "../include/attention.hpp"
 #include "../include/feed_forward.hpp"
 #include "../include/layer_norm.hpp"
@@ -16,6 +17,7 @@
 #include <iostream>
 #include <cstring>
 #include <algorithm>
+#include <functional>
 #include <memory>
 
 namespace gguf_export {
@@ -82,51 +84,34 @@ std::string convert_tensor_name(const std::string& internal_name, int layer_idx)
 // Main export function
 // ============================================================================
 
+namespace {
+
+// The tokenizer block, written where the word-level export always wrote it
+// (after the architecture metadata, before the tensors) when
+// config.include_tokenizer is set.
+using TokenizerBlock = std::function<void(GGUFWriter&, const TransformerConfig&)>;
+
+bool export_model(
+    const Transformer& transformer,
+    const std::string& output_path,
+    const GGUFExportConfig& config,
+    const TokenizerBlock& write_tokenizer
+);
+
+}  // namespace
+
 bool export_to_gguf(
     const Transformer& transformer,
     const TiktokenTokenizer& tokenizer,
     const std::string& output_path,
     const GGUFExportConfig& config
 ) {
-    std::cout << "GGUF Export: Starting export to " << output_path << std::endl;
-    if (!export_guard::llama_ffn_biases_zero(transformer, "GGUF export")) return false;
-
-    GGUFWriter writer(output_path);
-
-    // Get model config
-    const auto& model_config = transformer.getConfig();
-    const size_t head_dim = model_config.hidden_size / model_config.num_heads;
-
-    // ========== Write metadata ==========
-
-    // General metadata
-    writer.write_metadata_string("general.architecture", config.architecture);
-    writer.write_metadata_string("general.name", config.model_name);
-    writer.write_metadata_uint32("general.alignment", GGUF_DEFAULT_ALIGNMENT);
-
-    // Model architecture metadata (llama format)
-    std::string arch = config.architecture;
-    writer.write_metadata_uint32(arch + ".context_length", model_config.max_seq_length);
-    writer.write_metadata_uint32(arch + ".embedding_length", model_config.hidden_size);
-    writer.write_metadata_uint32(arch + ".block_count", model_config.num_layers);
-    writer.write_metadata_uint32(arch + ".feed_forward_length", model_config.intermediate_size);
-    writer.write_metadata_uint32(arch + ".attention.head_count", model_config.num_heads);
-    writer.write_metadata_uint32(arch + ".attention.head_count_kv", model_config.num_kv_heads);
-    writer.write_metadata_float32(arch + ".attention.layer_norm_rms_epsilon", model_config.layer_norm_epsilon);
-    writer.write_metadata_uint32(arch + ".vocab_size", model_config.vocab_size);
-
-    // RoPE metadata
-    if (model_config.use_rope) {
-        writer.write_metadata_float32(arch + ".rope.freq_base", 10000.0f);
-        writer.write_metadata_uint32(arch + ".rope.dimension_count",
-                                     static_cast<uint32_t>(head_dim));
-    }
-
-    // Tokenizer metadata. transformer_cpp's tokenizer is WORD-LEVEL
-    // (lowercased whole-word lookup with <unk> fallback), not BPE or
-    // SentencePiece. "word" is a custom model string; tinyllama.cpp carries a
-    // matching word-level tokenizer mode.
-    if (config.include_tokenizer) {
+    return export_model(transformer, output_path, config,
+                        [&tokenizer](GGUFWriter& writer, const TransformerConfig& model_config) {
+        // Tokenizer metadata. transformer_cpp's tokenizer is WORD-LEVEL
+        // (lowercased whole-word lookup with <unk> fallback), not BPE or
+        // SentencePiece. "word" is a custom model string; tinyllama.cpp carries a
+        // matching word-level tokenizer mode.
         writer.write_metadata_string("tokenizer.ggml.model", "word");
 
         std::vector<std::string> tokens;
@@ -170,7 +155,104 @@ bool export_to_gguf(
         writer.write_metadata_uint32("tokenizer.ggml.eos_token_id", eos_id);
         writer.write_metadata_uint32("tokenizer.ggml.unknown_token_id", 0);
         writer.write_metadata_uint32("tokenizer.ggml.padding_token_id", 0);
+    });
+}
+
+bool export_to_gguf(
+    const Transformer& transformer,
+    const byte_bpe::GgufTokenizer& vocab,
+    const std::string& output_path,
+    const GGUFExportConfig& config
+) {
+    // Refused before anything is written: an engine reading the file must
+    // encode text into the ids the model was trained on.
+    const size_t model_vocab = transformer.getConfig().vocab_size;
+    std::string why;
+    if (vocab.model != "bpe")
+        why = "tokenizer.ggml.model is '" + vocab.model + "', not 'bpe'";
+    else if (vocab.merges.empty())
+        why = "the vocabulary has no merges";
+    else if (vocab.tokens.size() != model_vocab)
+        why = "the vocabulary has " + std::to_string(vocab.tokens.size()) + " tokens, the model " +
+              std::to_string(model_vocab);
+    if (!why.empty()) {
+        std::cerr << "GGUF Export Error: BPE tokenizer refused: " << why << std::endl;
+        return false;
     }
+    return export_model(transformer, output_path, config,
+                        [&vocab](GGUFWriter& writer, const TransformerConfig&) {
+        // paperkiln's tokenizer block (src/gguf.cpp write_tokenizer) for a
+        // "bpe" vocabulary, key for key: its exports and these read the same
+        // in ember.cpp. Token types travel only with paperkiln's llama.cpp-form
+        // ("gpt2") vocabularies, so a "bpe" export has none.
+        writer.write_metadata_string("tokenizer.ggml.model", vocab.model);
+        if (!vocab.pre.empty()) writer.write_metadata_string("tokenizer.ggml.pre", vocab.pre);
+        writer.write_metadata_string_array("tokenizer.ggml.tokens", vocab.tokens);
+        writer.write_metadata_string_array("tokenizer.ggml.merges", vocab.merges);
+        if (!vocab.pre.empty()) {
+            // llama.cpp turns add_bos on for some pre-tokenizers unless these say otherwise.
+            writer.write_metadata_bool("tokenizer.ggml.add_bos_token", false);
+            writer.write_metadata_bool("tokenizer.ggml.add_eos_token", false);
+        }
+        writer.write_metadata_float_array("tokenizer.ggml.scores", std::vector<float>(vocab.tokens.size(), 0.0f));
+        uint32_t eos_id = 1;
+        for (size_t i = 0; i < vocab.tokens.size(); ++i) {
+            if (vocab.tokens[i] == "<|endoftext|>") {
+                eos_id = static_cast<uint32_t>(i);
+                break;
+            }
+        }
+        writer.write_metadata_uint32("tokenizer.ggml.bos_token_id", 1);
+        writer.write_metadata_uint32("tokenizer.ggml.eos_token_id", eos_id);
+        writer.write_metadata_uint32("tokenizer.ggml.unknown_token_id", 0);
+        writer.write_metadata_uint32("tokenizer.ggml.padding_token_id", 0);
+    });
+}
+
+namespace {
+
+bool export_model(
+    const Transformer& transformer,
+    const std::string& output_path,
+    const GGUFExportConfig& config,
+    const TokenizerBlock& write_tokenizer
+) {
+    std::cout << "GGUF Export: Starting export to " << output_path << std::endl;
+    if (!export_guard::llama_ffn_biases_zero(transformer, "GGUF export")) return false;
+
+    GGUFWriter writer(output_path);
+
+    // Get model config
+    const auto& model_config = transformer.getConfig();
+    const size_t head_dim = model_config.hidden_size / model_config.num_heads;
+
+    // ========== Write metadata ==========
+
+    // General metadata
+    writer.write_metadata_string("general.architecture", config.architecture);
+    writer.write_metadata_string("general.name", config.model_name);
+    writer.write_metadata_uint32("general.alignment", GGUF_DEFAULT_ALIGNMENT);
+
+    // Model architecture metadata (llama format)
+    std::string arch = config.architecture;
+    writer.write_metadata_uint32(arch + ".context_length", model_config.max_seq_length);
+    writer.write_metadata_uint32(arch + ".embedding_length", model_config.hidden_size);
+    writer.write_metadata_uint32(arch + ".block_count", model_config.num_layers);
+    writer.write_metadata_uint32(arch + ".feed_forward_length", model_config.intermediate_size);
+    writer.write_metadata_uint32(arch + ".attention.head_count", model_config.num_heads);
+    writer.write_metadata_uint32(arch + ".attention.head_count_kv", model_config.num_kv_heads);
+    writer.write_metadata_float32(arch + ".attention.layer_norm_rms_epsilon", model_config.layer_norm_epsilon);
+    writer.write_metadata_uint32(arch + ".vocab_size", model_config.vocab_size);
+
+    // RoPE metadata
+    if (model_config.use_rope) {
+        writer.write_metadata_float32(arch + ".rope.freq_base", 10000.0f);
+        writer.write_metadata_uint32(arch + ".rope.dimension_count",
+                                     static_cast<uint32_t>(head_dim));
+    }
+
+    // Tokenizer metadata: the caller's block (word-level or byte-level BPE).
+    if (config.include_tokenizer) write_tokenizer(writer, model_config);
 
     // ========== Collect and write tensors ==========
 
@@ -280,5 +362,7 @@ bool export_to_gguf(
     // Finalize and write (owned transposed buffers stay alive until here)
     return writer.finalize();
 }
+
+}  // namespace
 
 } // namespace gguf_export

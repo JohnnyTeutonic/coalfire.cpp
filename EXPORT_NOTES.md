@@ -46,6 +46,28 @@ RoPE, SwiGLU) exactly, 4/4 prompts.
 padding (offsets stay valid: they are relative to the data-section start)
 and patches the special-token ids. No tensor bytes change.
 
+## Byte-level BPE (3 Nov 2026, ROADMAP C5)
+
+`train --bpe-vocab VOCAB.gguf` trains on paperkiln's byte-level BPE instead
+of the word-level vocabulary. VOCAB.gguf is a vocabulary from paperkiln's
+`tools/bpe.py train` (or a BPE model export): `tokenizer.ggml.model = "bpe"`,
+the tokens as raw bytes (the specials `<unk>`, `<|endoftext|>`, `<|user|>`,
+`<|assistant|>`, the 256 bytes, one token per merge) and the merges as "a b"
+token-id pairs. The tokenizer is `include/byte_bpe_tokenizer.hpp`, the one
+paperkiln uses (vendored there as `microtorch::bpe`). The model's vocabulary
+is the BPE vocabulary's size (the presets' 5,000/20,000 caps do not apply),
+and each line of prose is encoded with its line break.
+
+`--export-gguf` then writes paperkiln's tokenizer block for a "bpe"
+vocabulary, entry for entry (`tests/bpe_export_test.cpp` compares the bytes
+with a paperkiln export): model `"bpe"`, the tokens, the merges, zero scores,
+bos = 1, eos = `<|endoftext|>` (1), unknown = padding = 0; `pre` (with
+`add_bos_token`/`add_eos_token` false) only when the vocabulary has one, and
+no token types, as paperkiln writes none for "bpe". ember.cpp reads it with
+the same tokenizer. Not supported with `--bpe-vocab`: `--assistant-loss`
+(its role markers are not single BPE tokens) and the safetensors/HF exports
+(their vocabulary sidecar is word-level).
+
 ## Known interop quirk (harmless for tinyllama.cpp)
 
 The writer emits tensor dims outer-first (e.g. `token_embd = [vocab,

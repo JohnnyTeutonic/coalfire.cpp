@@ -12,6 +12,7 @@
 #include "../include/transformer.hpp"
 #include "../include/config.hpp"
 #include "../include/tiktoken_tokenizer.hpp"
+#include "../include/byte_bpe_tokenizer.hpp"
 #include "../include/utils.hpp"
 #include "../include/quantization.hpp"
 #include "../include/logger.hpp"
@@ -39,6 +40,8 @@
 #include <filesystem>
 #include <limits>
 #include <cstdlib>
+#include <functional>
+#include <memory>
 
 #ifdef USE_CUDA
 /**
@@ -138,7 +141,14 @@ struct TrainingConfig {
     // (the SWA lesson: never let a knob silently mean different math on
     // different devices).
     float label_smoothing = 0.0f;
+    // Byte-level BPE (ROADMAP C5): a vocabulary GGUF from paperkiln's
+    // tools/bpe.py (tokenizer.ggml.model "bpe"), or a BPE model export. Empty
+    // = the word-level vocabulary built from the training files.
+    std::string bpe_vocab = "";
 };
+
+// Text -> token ids: the word-level tokenizer's or the byte-level BPE's.
+using TextEncoder = std::function<std::vector<int>(const std::string&)>;
 
 // Warmup + optional cosine decay. Peak = config LR; floor = 10% of peak.
 static float effective_lr_at(const TrainingConfig& config, size_t global_step) {
@@ -169,7 +179,7 @@ static float effective_lr_at(const TrainingConfig& config, size_t global_step) {
  */
 std::vector<std::vector<int>> load_and_tokenize_doc_aligned(
     const std::string& filepath,
-    TiktokenTokenizer& tokenizer,
+    const TextEncoder& encode,
     size_t max_seq_len
 ) {
     std::ifstream file(filepath);
@@ -179,7 +189,7 @@ std::vector<std::vector<int>> load_and_tokenize_doc_aligned(
     std::vector<std::vector<int>> batches;
     std::vector<int> window;
     std::string line;
-    const std::vector<int> turn_tok = tokenizer.encode("user:");
+    const std::vector<int> turn_tok = encode("user:");
     const int user_id = turn_tok.empty() ? -1 : turn_tok[0];
 
     auto flush_window = [&]() {
@@ -189,7 +199,7 @@ std::vector<std::vector<int>> load_and_tokenize_doc_aligned(
 
     while (std::getline(file, line)) {
         if (line.empty()) continue;
-        auto doc = tokenizer.encode(line);
+        auto doc = encode(line);
         if (doc.size() < 2) continue;
 
         // Oversized document: split at turn boundaries ("user:") under the cap
@@ -219,11 +229,16 @@ std::vector<std::vector<int>> load_and_tokenize_doc_aligned(
 
 /**
  * @brief Load text file and tokenize
+ *
+ * line_end is appended to each line before it is encoded: "" for the
+ * word-level tokenizer (whitespace carries no ids), "\n" for byte-level BPE,
+ * which encodes the line breaks as paperkiln does.
  */
 std::vector<std::vector<int>> load_and_tokenize(
     const std::string& filepath,
-    TiktokenTokenizer& tokenizer,
-    size_t max_seq_len
+    const TextEncoder& encode,
+    size_t max_seq_len,
+    const std::string& line_end = ""
 ) {
     std::ifstream file(filepath);
     if (!file.is_open()) {
@@ -240,7 +255,7 @@ std::vector<std::vector<int>> load_and_tokenize(
         if (line.empty()) continue;
         
         // Tokenize line
-        auto tokens = tokenizer.encode(line);
+        auto tokens = encode(line + line_end);
         
         // Add to current batch
         current_batch.insert(current_batch.end(), tokens.begin(), tokens.end());
@@ -1126,6 +1141,8 @@ int main(int argc, char** argv) {
                 train_config.early_stop_min_delta = std::stof(argv[++i]);
             } else if (arg == "--cosine-decay") {
                 train_config.cosine_decay = true;
+            } else if (arg == "--bpe-vocab" && i + 1 < argc) {
+                train_config.bpe_vocab = argv[++i];
             } else if (arg == "--help" || arg == "-h") {
                 std::cout << "Usage: train_wikitext [data_path] [options]\n"
                           << "  --small             use truncated *-small.txt train files\n"
@@ -1145,7 +1162,11 @@ int main(int argc, char** argv) {
                           << "                      {\"architecture\": {\"family\": ..., \"overrides\": {...}}})\n"
                           << "  --family NAME       architecture family preset: llama (default) | vanilla\n"
                           << "  --lora [RANK]       LoRA fine-tuning: freeze base, train rank-r adapters\n"
-                          << "                      (default rank 8; pair with --resume CKPT)\n";
+                          << "                      (default rank 8; pair with --resume CKPT)\n"
+                          << "  --bpe-vocab PATH    byte-level BPE instead of the word-level vocabulary:\n"
+                          << "                      a vocabulary GGUF from paperkiln's tools/bpe.py (or a\n"
+                          << "                      BPE model export); the model's vocabulary is its size,\n"
+                          << "                      and --export-gguf writes the BPE tokenizer\n";
                 return 0;
             } else if (arg.find("--") != 0) {
                 train_config.data_path = arg;
@@ -1170,12 +1191,28 @@ int main(int argc, char** argv) {
             std::cerr << "Warning: Failed to create output directory: " << e.what() << std::endl;
         }
         
+        // Byte-level BPE (--bpe-vocab): refuse the paths it does not support
+        // before any work is done.
+        const bool use_bpe = !train_config.bpe_vocab.empty();
+        if (use_bpe) {
+            if (train_config.assistant_only_loss) {
+                throw std::runtime_error("--assistant-loss needs \"user:\" and \"assistant:\" to be single "
+                                         "word-level tokens; it is not supported with --bpe-vocab");
+            }
+            if (!train_config.export_safetensors.empty() || !train_config.export_hf.empty()) {
+                throw std::runtime_error("--export-safetensors and --export-hf write a word-level vocabulary "
+                                         "sidecar; with --bpe-vocab export GGUF only");
+            }
+        }
+
         // Initialize tokenizer FIRST
         std::cout << "\nInitializing tokenizer..." << std::endl;
         auto tokenizer = std::make_shared<TiktokenTokenizer>();
-        
+        byte_bpe::GgufTokenizer bpe_vocab;            // --bpe-vocab: the file's tokenizer block
+        std::unique_ptr<byte_bpe::Tokenizer> bpe;     // --bpe-vocab: encodes the data
+
         // Build vocabulary from WikiText training data itself
-        std::cout << "Building vocabulary from WikiText data..." << std::endl;
+        if (!use_bpe) std::cout << "Building vocabulary from WikiText data..." << std::endl;
         // Select training files: small files for CPU builds or when --small is given,
         // full files for the GPU build otherwise.
         bool use_small_files = train_config.use_small;
@@ -1192,21 +1229,42 @@ int main(int argc, char** argv) {
         }
         std::cout << "Training files: " << train_file_0 << ", " << train_file_1 << std::endl;
         
-        // Build vocab from both training files using plain text method
-        try {
-            std::cout << "Processing train-0.txt..." << std::endl;
-            tokenizer->build_vocabulary_from_plain_text(train_file_0);
-            
-            std::cout << "Processing train-1.txt..." << std::endl;
-            tokenizer->build_vocabulary_from_plain_text(train_file_1);
-            
-            std::cout << "Final vocabulary size: " << tokenizer->vocab_size() << " tokens" << std::endl;
-        } catch (const std::exception& e) {
-            std::cerr << "ERROR: Could not build vocabulary from WikiText data: " << e.what() << std::endl;
-            std::cerr << "Falling back to training_pairs.txt..." << std::endl;
-            tokenizer->build_vocabulary_from_file("../data/training_pairs.txt");
-            std::cout << "Vocabulary size: " << tokenizer->vocab_size() << " tokens" << std::endl;
+        if (use_bpe) {
+            // The BPE vocabulary encodes the data; the word-level tokenizer the
+            // model is wired to holds an id-indexed copy of its tokens, so the
+            // model's vocabulary is the BPE vocabulary.
+            bpe_vocab = byte_bpe::read_gguf_tokenizer(train_config.bpe_vocab);
+            if (bpe_vocab.model != "bpe") {
+                throw std::runtime_error(train_config.bpe_vocab + ": tokenizer.ggml.model is '" +
+                                         bpe_vocab.model + "', not 'bpe'");
+            }
+            bpe = std::make_unique<byte_bpe::Tokenizer>(bpe_vocab.tokens, bpe_vocab.merges);
+            tokenizer->load_vocabulary_from_tokens(bpe_vocab.tokens);
+            std::cout << "Byte-level BPE vocabulary " << train_config.bpe_vocab << ": "
+                      << bpe->size() << " tokens, " << bpe_vocab.merges.size() << " merges" << std::endl;
+        } else {
+            // Build vocab from both training files using plain text method
+            try {
+                std::cout << "Processing train-0.txt..." << std::endl;
+                tokenizer->build_vocabulary_from_plain_text(train_file_0);
+
+                std::cout << "Processing train-1.txt..." << std::endl;
+                tokenizer->build_vocabulary_from_plain_text(train_file_1);
+
+                std::cout << "Final vocabulary size: " << tokenizer->vocab_size() << " tokens" << std::endl;
+            } catch (const std::exception& e) {
+                std::cerr << "ERROR: Could not build vocabulary from WikiText data: " << e.what() << std::endl;
+                std::cerr << "Falling back to training_pairs.txt..." << std::endl;
+                tokenizer->build_vocabulary_from_file("../data/training_pairs.txt");
+                std::cout << "Vocabulary size: " << tokenizer->vocab_size() << " tokens" << std::endl;
+            }
         }
+        // The data's encoder, and what follows each line of prose (see
+        // load_and_tokenize).
+        const TextEncoder encode = use_bpe
+            ? TextEncoder([&bpe](const std::string& s) { return bpe->encode(s); })
+            : TextEncoder([&tokenizer](const std::string& s) { return tokenizer->encode(s); });
+        const std::string line_end = use_bpe ? "\n" : "";
         
         // Now initialize model config with vocabulary size from tokenizer
         TransformerConfig model_config;
@@ -1243,6 +1301,10 @@ int main(int argc, char** argv) {
             model_config.intermediate_size = 512;
 #endif
         }
+        // A BPE vocabulary is never capped: an id past the cap would be
+        // remapped to <unk> below, and the exported tokenizer would encode
+        // text into ids the model never trained.
+        if (use_bpe) model_config.vocab_size = bpe->size();
         model_config.head_dim = model_config.hidden_size / model_config.num_heads;
         model_config.max_seq_length = train_config.max_seq_len;
         model_config.dropout_rate = 0.1f;
@@ -1338,14 +1400,14 @@ int main(int argc, char** argv) {
         
         // Load train-0-small.txt (using same path as vocab building)
         auto train_data_0 = train_config.doc_aligned
-            ? load_and_tokenize_doc_aligned(train_file_0, *tokenizer, train_config.max_seq_len)
-            : load_and_tokenize(train_file_0, *tokenizer, train_config.max_seq_len);
+            ? load_and_tokenize_doc_aligned(train_file_0, encode, train_config.max_seq_len)
+            : load_and_tokenize(train_file_0, encode, train_config.max_seq_len, line_end);
         train_data.insert(train_data.end(), train_data_0.begin(), train_data_0.end());
         
         // Load train-1-small.txt (using same path as vocab building)
         auto train_data_1 = train_config.doc_aligned
-            ? load_and_tokenize_doc_aligned(train_file_1, *tokenizer, train_config.max_seq_len)
-            : load_and_tokenize(train_file_1, *tokenizer, train_config.max_seq_len);
+            ? load_and_tokenize_doc_aligned(train_file_1, encode, train_config.max_seq_len)
+            : load_and_tokenize(train_file_1, encode, train_config.max_seq_len, line_end);
         train_data.insert(train_data.end(), train_data_1.begin(), train_data_1.end());
         
         // Optionally cap number of training sequences (fast smoke tests)
@@ -1357,8 +1419,8 @@ int main(int argc, char** argv) {
         // Load validation data
         std::string val_file = train_config.data_path + "/validation.txt";
         auto val_data = train_config.doc_aligned
-            ? load_and_tokenize_doc_aligned(val_file, *tokenizer, train_config.max_seq_len)
-            : load_and_tokenize(val_file, *tokenizer, train_config.max_seq_len);
+            ? load_and_tokenize_doc_aligned(val_file, encode, train_config.max_seq_len)
+            : load_and_tokenize(val_file, encode, train_config.max_seq_len, line_end);
         
         // The tokenizer's vocab cap (20k) can exceed the model preset's cap
         // (5k on --mid/--tiny). The CUDA embedding gather is unchecked, so an
@@ -1634,12 +1696,23 @@ int main(int argc, char** argv) {
 #endif
             gguf_export::GGUFExportConfig export_cfg;
             export_cfg.model_name = "transformer_cpp_wikitext";
-            if (gguf_export::export_to_gguf(transformer, *tokenizer,
-                                            train_config.export_gguf, export_cfg)) {
+            const bool exported = use_bpe
+                ? gguf_export::export_to_gguf(transformer, bpe_vocab, train_config.export_gguf, export_cfg)
+                : gguf_export::export_to_gguf(transformer, *tokenizer, train_config.export_gguf, export_cfg);
+            if (exported) {
                 std::cout << "GGUF export complete: " << train_config.export_gguf << std::endl;
             } else {
                 std::cerr << "GGUF export FAILED" << std::endl;
             }
+        }
+
+        // A config file's export block can still ask for safetensors with
+        // --bpe-vocab; its word-level vocabulary sidecar would be wrong.
+        if (use_bpe && (!train_config.export_safetensors.empty() || !train_config.export_hf.empty())) {
+            std::cerr << "Safetensors/HF export skipped: not supported with --bpe-vocab (export GGUF)"
+                      << std::endl;
+            train_config.export_safetensors.clear();
+            train_config.export_hf.clear();
         }
 
         // Export to safetensors (same tensor enumeration/layout as GGUF)

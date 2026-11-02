@@ -9,6 +9,7 @@ private:
     std::unordered_map<std::string, int> word_to_id_;
     std::unordered_map<int, std::string> id_to_word_;
     bool initialized_ = false;
+    bool id_indexed_ = false;  // set by load_vocabulary_from_tokens only
     static constexpr int UNK_ID = 0;
     static constexpr const char* UNK_TOKEN = "<unk>";
     static constexpr int SEP_ID = 1;  // Add separator token ID
@@ -31,7 +32,13 @@ public:
     // through the id list embedded in its exported GGUF
     // (scripts/extract_gguf_vocab.py).
     void load_vocabulary_from_id_list(const std::string& filepath);
-    size_t vocab_size() const { return word_to_id_.size(); }
+    // An id-indexed copy of another tokenizer's vocabulary (train --bpe-vocab:
+    // the byte-level BPE tokens of byte_bpe_tokenizer.hpp), for the model's
+    // wiring: vocab_size() is tokens.size() and decode({id}) is tokens[id],
+    // even when two ids share a string. encode() stays the word-level lookup;
+    // the data is encoded by the BPE tokenizer, never by this one.
+    void load_vocabulary_from_tokens(const std::vector<std::string>& tokens);
+    size_t vocab_size() const { return id_indexed_ ? id_to_word_.size() : word_to_id_.size(); }
     bool is_initialized() const { return initialized_; }
     
     // Token type checking

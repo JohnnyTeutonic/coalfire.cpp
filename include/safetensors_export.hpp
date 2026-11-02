@@ -24,7 +24,10 @@ namespace safetensors_export {
 
 struct SafetensorsExportConfig {
     std::string model_name = "transformer_cpp";
-    bool tie_word_embeddings = false;  // matches GGUFExportConfig default
+    // Omit the head tensor (as GGUFExportConfig's flag does). Refused, writing
+    // nothing, unless the model's head is exactly the transposed embedding with
+    // a zero bias (export_guard::tied_head_lossless).
+    bool tie_word_embeddings = false;
     bool write_vocab_sidecar = true;
 };
 

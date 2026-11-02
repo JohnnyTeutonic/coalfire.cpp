@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <mutex>
 #include <string>
 
 // Disable verbose logging for production builds (MASSIVELY speeds up training)
@@ -96,6 +97,20 @@ MultiHeadAttention::MultiHeadAttention(size_t hidden_size_, size_t num_heads_, s
 
     DEBUG_LOG(SCOPE_LOG());
     DEBUG_COUT << "\n=== MultiHeadAttention::constructor START ===" << std::endl;
+
+    // Grouped-query attention is not implemented: K and V below are always
+    // [hidden, hidden], one K/V head per query head. Say so once per process
+    // rather than silently training (and exporting) full multi-head attention.
+    if (use_gqa_ || (num_kv_heads_ > 0 && num_kv_heads_ < num_heads_)) {
+        static std::once_flag warned;
+        std::call_once(warned, [&] {
+            std::cerr << "Warning: grouped-query attention was requested (attention: gqa, num_kv_heads "
+                      << num_kv_heads_ << ", num_heads " << num_heads_
+                      << "), but it is not implemented. The model uses full multi-head attention with "
+                      << num_heads_ << " K/V heads, and its exports declare " << num_heads_ << " KV heads."
+                      << std::endl;
+        });
+    }
 
     // Initialize matrices with correct dimensions
     params_.query_weights = Matrix(hidden_size_, hidden_size_);

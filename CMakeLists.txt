@@ -282,6 +282,22 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(repro_reduce_demo PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
+# GGUF writer tests (ctest). gguf_writer_test needs only the standalone
+# header include/gguf_writer.hpp; gguf_export_test checks export_to_gguf's
+# files against their recorded SHA-256s (byte identity, ROADMAP C3). Only
+# when coalfire is the top-level project: paperkiln vendors this tree
+# without tests/ and builds it with add_subdirectory.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    enable_testing()
+    add_executable(gguf_writer_test tests/gguf_writer_test.cpp)
+    target_include_directories(gguf_writer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME gguf_writer COMMAND gguf_writer_test)
+    add_executable(gguf_export_test tests/gguf_export_test.cpp)
+    target_link_libraries(gguf_export_test PRIVATE transformer_core)
+    target_include_directories(gguf_export_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME gguf_export COMMAND gguf_export_test)
+endif()
+
 message(STATUS "")
 message(STATUS "================================")
 if(CUDA_ENABLED)

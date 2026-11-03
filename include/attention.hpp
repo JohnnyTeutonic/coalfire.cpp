@@ -522,10 +522,32 @@ class MultiHeadAttention {
     // Private helper methods
     Vector apply_rope(const Vector& x, size_t position) const;
 
-    /// Apply RoPE rotation in-place to every row of a [batch*seq x hidden]
+    /// Apply RoPE rotation in-place to every row of a [batch*seq x heads*head_dim]
     /// matrix (row r -> position r % seq_len). inverse=true applies the
     /// transpose rotation (rotate by -theta), used in the backward pass.
-    void rotate_rows_rope(Matrix& m, size_t seq_len, bool inverse) const;
+    /// heads = 0 means num_heads; K at KV width passes kv_heads().
+    void rotate_rows_rope(Matrix& m, size_t seq_len, bool inverse, size_t heads = 0) const;
+
+  public:
+    // ---- Grouped-query attention (GQA) ----
+    // With use_gqa and 0 < num_kv_heads < num_heads (num_heads a multiple of
+    // num_kv_heads), K and V project to kv_dim() = num_kv_heads * head_size
+    // columns, and query head h reads KV head h / (num_heads / num_kv_heads),
+    // the contiguous grouping HF Llama and llama.cpp use. Otherwise attention
+    // is full multi-head: kv_heads() == num_heads, kv_dim() == hidden_size.
+    size_t kv_heads() const {
+        return (use_gqa && num_kv_heads > 0 && num_kv_heads < num_heads) ? num_kv_heads : num_heads;
+    }
+    size_t kv_dim() const { return kv_heads() * (hidden_size / num_heads); }
+    bool gqa_active() const { return kv_heads() != num_heads; }
+
+  private:
+    /// [rows x kv_dim] -> [rows x hidden]: column h*hd + d of the result is
+    /// column (h / group)*hd + d of kv. Returns kv unchanged when !gqa_active().
+    Matrix expand_kv_heads(const Matrix& kv) const;
+    /// The adjoint of expand_kv_heads: [rows x hidden] -> [rows x kv_dim],
+    /// summing each KV head's group of query-head columns (h ascending).
+    Matrix reduce_kv_heads(const Matrix& full) const;
     Matrix flash_attention(const Matrix& Q, const Matrix& K, const Matrix& V,
                            const AttentionMask& mask) const;
     Matrix standard_attention(const Matrix& Q, const Matrix& K, const Matrix& V,

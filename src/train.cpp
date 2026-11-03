@@ -1313,9 +1313,10 @@ int main(int argc, char** argv) {
         model_config.gradient_clip_threshold = 1.0f;  // Tightened from 5.0 for stability
         model_config.use_flash_attention = false;  // Disable buggy fused attention kernels
 
-        // Keep attention config self-consistent: the batched path uses full multi-head
-        // attention (num_heads), so disable GQA and align num_kv_heads with num_heads.
-        // (Previously num_kv_heads kept a stale default of 12 while num_heads was 8.)
+        // Default to full multi-head attention with num_kv_heads aligned to num_heads
+        // (num_kv_heads once kept a stale default of 12 while num_heads was 8). The
+        // architecture spec below, and a --config overlay's "architecture" block, set
+        // attention: gqa and its num_kv_heads, which MultiHeadAttention implements.
         model_config.use_gqa = false;
         model_config.num_kv_heads = model_config.num_heads;
 

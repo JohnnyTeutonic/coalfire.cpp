@@ -98,40 +98,43 @@ MultiHeadAttention::MultiHeadAttention(size_t hidden_size_, size_t num_heads_, s
     DEBUG_LOG(SCOPE_LOG());
     DEBUG_COUT << "\n=== MultiHeadAttention::constructor START ===" << std::endl;
 
-    // Grouped-query attention is not implemented: K and V below are always
-    // [hidden, hidden], one K/V head per query head. Say so once per process
-    // rather than silently training (and exporting) full multi-head attention.
-    if (use_gqa_ || (num_kv_heads_ > 0 && num_kv_heads_ < num_heads_)) {
-        static std::once_flag warned;
-        std::call_once(warned, [&] {
-            std::cerr << "Warning: grouped-query attention was requested (attention: gqa, num_kv_heads "
-                      << num_kv_heads_ << ", num_heads " << num_heads_
-                      << "), but it is not implemented. The model uses full multi-head attention with "
-                      << num_heads_ << " K/V heads, and its exports declare " << num_heads_ << " KV heads."
-                      << std::endl;
-        });
+    // Grouped-query attention: K and V project to kv_dim = num_kv_heads *
+    // head_size columns (see kv_heads() in attention.hpp). Anything other than
+    // a whole number of query heads per KV head is refused rather than run as
+    // something else.
+    size_t kv_cols = hidden_size_;
+    if (use_gqa_ && num_kv_heads_ > 0 && num_kv_heads_ != num_heads_) {
+        if (num_heads_ == 0 || hidden_size_ % num_heads_ != 0 || num_kv_heads_ > num_heads_ ||
+            num_heads_ % num_kv_heads_ != 0 || head_dim_ != hidden_size_ / num_heads_) {
+            throw std::runtime_error(
+                "grouped-query attention needs num_heads a multiple of num_kv_heads and head_dim = "
+                "hidden_size / num_heads (hidden_size " + std::to_string(hidden_size_) +
+                ", num_heads " + std::to_string(num_heads_) + ", num_kv_heads " +
+                std::to_string(num_kv_heads_) + ", head_dim " + std::to_string(head_dim_) + ")");
+        }
+        kv_cols = num_kv_heads_ * (hidden_size_ / num_heads_);
     }
 
     // Initialize matrices with correct dimensions
     params_.query_weights = Matrix(hidden_size_, hidden_size_);
-    params_.key_weights = Matrix(hidden_size_, hidden_size_);
-    params_.value_weights = Matrix(hidden_size_, hidden_size_);
+    params_.key_weights = Matrix(hidden_size_, kv_cols);
+    params_.value_weights = Matrix(hidden_size_, kv_cols);
     params_.output_weights = Matrix(hidden_size_, hidden_size_);
 
     // Initialize bias vectors - size should match output dimension of weights
     params_.query_bias = FloatVector(hidden_size_);  // Match query_weights.cols()
-    params_.key_bias = FloatVector(hidden_size_);    // Match key_weights.cols()
-    params_.value_bias = FloatVector(hidden_size_);  // Match value_weights.cols()
+    params_.key_bias = FloatVector(kv_cols);         // Match key_weights.cols()
+    params_.value_bias = FloatVector(kv_cols);       // Match value_weights.cols()
     params_.output_bias = FloatVector(hidden_size_);
 
     // Initialize gradients
     grads_.query_grad = Matrix(hidden_size_, hidden_size_);
-    grads_.key_grad = Matrix(hidden_size_, hidden_size_);
-    grads_.value_grad = Matrix(hidden_size_, hidden_size_);
+    grads_.key_grad = Matrix(hidden_size_, kv_cols);
+    grads_.value_grad = Matrix(hidden_size_, kv_cols);
     grads_.output_grad = Matrix(hidden_size_, hidden_size_);
     grads_.query_bias_grad = FloatVector(hidden_size_);  // Match query_bias
-    grads_.key_bias_grad = FloatVector(hidden_size_);    // Match key_bias
-    grads_.value_bias_grad = FloatVector(hidden_size_);  // Match value_bias
+    grads_.key_bias_grad = FloatVector(kv_cols);         // Match key_bias
+    grads_.value_bias_grad = FloatVector(kv_cols);       // Match value_bias
     grads_.output_bias_grad = FloatVector(hidden_size_);
 
     // Print configuration
@@ -310,13 +313,16 @@ Matrix MultiHeadAttention::forward(const Matrix& input, const AttentionMask& mas
     }
 
 #ifdef USE_CUDA
-    // Use fused attention kernel for better performance when available
-    if (use_fused_attention_ && !kv_cache) {
+    // Use fused attention kernel for better performance when available. Not
+    // under grouped-query attention: the fused kernel applies no RoPE and keeps
+    // no backward caches, so a GQA model takes the path below (K/V expanded,
+    // RoPE applied). The multi-head dispatch is unchanged.
+    if (use_fused_attention_ && !kv_cache && !gqa_active()) {
         return forward_fused(input, mask);
     }
 #endif
 
-    // Project input to Q, K, V using matmul
+    // Project input to Q, K, V using matmul (K, V at kv_dim columns under GQA)
     Matrix Q = matmul(input, params_.query_weights);
     Matrix K = matmul(input, params_.key_weights);
     Matrix V = matmul(input, params_.value_weights);
@@ -324,11 +330,22 @@ Matrix MultiHeadAttention::forward(const Matrix& input, const AttentionMask& mas
     for (size_t i = 0; i < Q.rows(); i++) {
         for (size_t j = 0; j < Q.cols(); j++) {
             Q(i, j) += params_.query_bias[j];
+        }
+        for (size_t j = 0; j < K.cols(); j++) {
             K(i, j) += params_.key_bias[j];
             V(i, j) += params_.value_bias[j];
         }
     }
-    
+    // GQA: repeat each KV head across its query-head group; everything below
+    // (caches, the KV cache, the per-head loop and its RoPE) is full width.
+    // A KVCache passed in therefore holds full-width (expanded) K/V rows, the
+    // layout it always had. RoPE is per-head with the same angles in every
+    // head, so rotating the expanded K equals expanding the rotated one.
+    if (gqa_active()) {
+        K = expand_kv_heads(K);
+        V = expand_kv_heads(V);
+    }
+
     // CRITICAL: Cache Q, K, V for backward pass
     cached_query_layer = Q;
     cached_key_layer = K;
@@ -475,16 +492,59 @@ Matrix MultiHeadAttention::forward(const Matrix& input, const AttentionMask& mas
 
 // ========== BATCHED FORWARD: O(batch × seq²) instead of O((batch×seq)²) ==========
 // Optimized: Do QKV projections in ONE batch, then per-sequence attention
-void MultiHeadAttention::rotate_rows_rope(Matrix& m, size_t seq_len, bool inverse) const {
+Matrix MultiHeadAttention::expand_kv_heads(const Matrix& kv) const {
+    if (!gqa_active()) return kv;
+    const size_t hd = hidden_size / num_heads;
+    const size_t group = num_heads / kv_heads();
+    if (kv.cols() != kv_dim()) {
+        throw std::runtime_error("expand_kv_heads: " + std::to_string(kv.cols()) +
+                                 " columns, expected kv_dim " + std::to_string(kv_dim()));
+    }
+    Matrix full(kv.rows(), hidden_size);
+    #pragma omp parallel for
+    for (int r = 0; r < static_cast<int>(kv.rows()); r++) {
+        for (size_t h = 0; h < num_heads; h++) {
+            const size_t src = (h / group) * hd;
+            const size_t dst = h * hd;
+            for (size_t d = 0; d < hd; d++) full(r, dst + d) = kv(r, src + d);
+        }
+    }
+    return full;
+}
+
+Matrix MultiHeadAttention::reduce_kv_heads(const Matrix& full) const {
+    if (!gqa_active()) return full;
+    const size_t hd = hidden_size / num_heads;
+    const size_t group = num_heads / kv_heads();
+    if (full.cols() != hidden_size) {
+        throw std::runtime_error("reduce_kv_heads: " + std::to_string(full.cols()) +
+                                 " columns, expected hidden_size " + std::to_string(hidden_size));
+    }
+    Matrix kv(full.rows(), kv_dim(), 0.0f);
+    #pragma omp parallel for
+    for (int r = 0; r < static_cast<int>(full.rows()); r++) {
+        for (size_t h = 0; h < num_heads; h++) {  // h ascending: a fixed summation order
+            const size_t dst = (h / group) * hd;
+            const size_t src = h * hd;
+            for (size_t d = 0; d < hd; d++) kv(r, dst + d) += full(r, src + d);
+        }
+    }
+    return kv;
+}
+
+void MultiHeadAttention::rotate_rows_rope(Matrix& m, size_t seq_len, bool inverse,
+                                          size_t heads) const {
     // Adjacent-pairing RoPE, matching apply_rope() and tinyllama.cpp's GGUF
     // path: within each head, pair (2i, 2i+1) rotates by theta_i = pos *
     // 10000^(-2i/head_dim). The static cache stores cos/sin at
-    // (pos, head*head_dim + i) for i in [0, head_dim/2).
+    // (pos, head*head_dim + i) for i in [0, head_dim/2); the angles are the
+    // same in every head, so a KV-width matrix rotates with heads = kv_heads().
     const float sign = inverse ? -1.0f : 1.0f;
+    const size_t n_heads = heads ? heads : num_heads;
     #pragma omp parallel for
     for (int r = 0; r < static_cast<int>(m.rows()); r++) {
         const size_t pos = static_cast<size_t>(r) % seq_len;
-        for (size_t h = 0; h < num_heads; h++) {
+        for (size_t h = 0; h < n_heads; h++) {
             const size_t head_offset = h * head_dim;
             for (size_t i = 0; i < head_dim / 2; i++) {
                 const size_t cache_idx = h * head_dim + i;
@@ -512,16 +572,20 @@ Matrix MultiHeadAttention::forward_batched(const Matrix& input, const AttentionM
     const float scale = 1.0f / std::sqrt(static_cast<float>(head_size));
     
     // ========== STEP 1: BATCH QKV PROJECTIONS (3 big matmuls instead of 3*batch small ones) ==========
-    // Q, K, V: [total_positions x hidden_size]
+    // Q: [total_positions x hidden_size]; K, V: [total_positions x kv_dim]
+    // (kv_dim == hidden_size unless grouped-query attention is active)
     Matrix Q = matmul(input, params_.query_weights);
     Matrix K = matmul(input, params_.key_weights);
     Matrix V = matmul(input, params_.value_weights);
-    
+    const size_t kv_cols = K.cols();
+
     // Add biases (parallelized)
     #pragma omp parallel for
     for (int i = 0; i < static_cast<int>(total_positions); i++) {
         for (size_t j = 0; j < hidden_size; j++) {
             Q(i, j) += params_.query_bias[j];
+        }
+        for (size_t j = 0; j < kv_cols; j++) {
             K(i, j) += params_.key_bias[j];
             V(i, j) += params_.value_bias[j];
         }
@@ -530,10 +594,17 @@ Matrix MultiHeadAttention::forward_batched(const Matrix& input, const AttentionM
     // Rotary position embeddings (LLaMA-style, adjacent pairing).
     // Applied post-projection; the caches hold the ROTATED Q/K, which is what
     // the exact backward needs for the score-path gradients (the weight-path
-    // gradients un-rotate first).
+    // gradients un-rotate first). K rotates at its own (KV) head count.
     if (use_rope) {
         rotate_rows_rope(Q, seq_len, /*inverse=*/false);
-        rotate_rows_rope(K, seq_len, /*inverse=*/false);
+        rotate_rows_rope(K, seq_len, /*inverse=*/false, kv_heads());
+    }
+
+    // GQA: repeat each KV head across its group of query heads. The caches,
+    // the CUDA kernels and the CPU loop below all work at full width.
+    if (gqa_active()) {
+        K = expand_kv_heads(K);
+        V = expand_kv_heads(V);
     }
 
     // Cache for backward pass
@@ -929,6 +1000,15 @@ Matrix MultiHeadAttention::backward(const Matrix& grad_output, const Matrix& inp
                 rotate_rows_rope(dK, S_len, /*inverse=*/true);
             }
 
+            // GQA: K and V were expanded from kv_dim columns by repeating each
+            // KV head across its query-head group, so their gradients are the
+            // group sums (the adjoint of the expansion). From here on dK, dV
+            // are [rows x kv_dim], matching W_k, W_v.
+            if (gqa_active()) {
+                dK = reduce_kv_heads(dK);
+                dV = reduce_kv_heads(dV);
+            }
+
             // Weight gradients: input^T @ dProj, averaged over rows
             Matrix input_t_local = input.transpose();
             Matrix query_weight_grad = matmul(input_t_local, dQ);
@@ -942,9 +1022,12 @@ Matrix MultiHeadAttention::backward(const Matrix& grad_output, const Matrix& inp
             Vector query_bias_grad = Vector(params_.query_bias.size(), 0.0f);
             Vector key_bias_grad = Vector(params_.key_bias.size(), 0.0f);
             Vector value_bias_grad = Vector(params_.value_bias.size(), 0.0f);
+            const size_t kv_cols = dK.cols();
             for (size_t i = 0; i < input.rows(); ++i) {
                 for (size_t j = 0; j < hidden_size; ++j) {
                     query_bias_grad[j] += dQ(i, j) * grad_scale;
+                }
+                for (size_t j = 0; j < kv_cols; ++j) {
                     key_bias_grad[j] += dK(i, j) * grad_scale;
                     value_bias_grad[j] += dV(i, j) * grad_scale;
                 }
@@ -984,7 +1067,13 @@ Matrix MultiHeadAttention::backward(const Matrix& grad_output, const Matrix& inp
             
             Matrix d_K = d_attn_out;
             d_K *= (scale * 0.5f);  // Scale down K gradient
-            
+
+            // GQA: reduce to the KV heads so the shapes match W_k, W_v
+            if (gqa_active()) {
+                d_V = reduce_kv_heads(d_V);
+                d_K = reduce_kv_heads(d_K);
+            }
+
             // Step 3: Weight gradients (input^T @ d_projection, normalized by batch)
             Matrix input_t_local = input.transpose();
             Matrix query_weight_grad = matmul(input_t_local, d_Q);
@@ -1001,6 +1090,8 @@ Matrix MultiHeadAttention::backward(const Matrix& grad_output, const Matrix& inp
             for (size_t i = 0; i < batch_size; ++i) {
                 for (size_t j = 0; j < query_bias_grad.size(); ++j) {
                     query_bias_grad[j] += d_Q(i, j) * grad_scale;
+                }
+                for (size_t j = 0; j < key_bias_grad.size(); ++j) {
                     key_bias_grad[j] += d_K(i, j) * grad_scale;
                     value_bias_grad[j] += d_V(i, j) * grad_scale;
                 }
@@ -1048,8 +1139,10 @@ Matrix MultiHeadAttention::backward(const Matrix& grad_output, const Matrix& inp
         }
 
         // Legacy approximation (non-batched path only): value projection path
+        // (under GQA through the KV-head-reduced d_attn_out, matching W_v)
         Matrix value_weights_t = params_.value_weights.transpose();
-        Matrix d_input = matmul(d_attn_out, value_weights_t);
+        Matrix d_input = gqa_active() ? matmul(reduce_kv_heads(d_attn_out), value_weights_t)
+                                      : matmul(d_attn_out, value_weights_t);
 
         DEBUG_COUT << "=== MultiHeadAttention::backward END ===\n" << std::endl;
         return d_input;
@@ -1612,6 +1705,26 @@ std::unique_ptr<MultiHeadAttention> MultiHeadAttention::load(std::istream& is, c
     DEBUG_COUT << "- Head dimension: " << head_dim << std::endl;
     DEBUG_COUT << "- Hidden size: " << hidden_size << std::endl;
 
+    // Load weight matrices
+    DEBUG_COUT << "Loading weight matrices..." << std::endl;
+    Matrix query_weights = Matrix::load(is);
+    Matrix key_weights = Matrix::load(is);
+    Matrix value_weights = Matrix::load(is);
+    Matrix output_weights = Matrix::load(is);
+
+    // Before grouped-query attention was implemented (3 Nov 2026) a model
+    // configured with attention: gqa recorded use_gqa and num_kv_heads but
+    // trained full multi-head attention: its K/V are [hidden, hidden]. Load
+    // such a checkpoint as the multi-head model it is.
+    if (use_gqa && num_kv_heads > 0 && num_kv_heads < num_heads &&
+        key_weights.cols() == hidden_size && value_weights.cols() == hidden_size) {
+        std::cerr << "Warning: checkpoint records attention: gqa (num_kv_heads " << num_kv_heads
+                  << ") with [hidden, hidden] K/V weights, written before grouped-query attention was"
+                     " implemented; loading it as the full multi-head attention it trained." << std::endl;
+        use_gqa = false;
+        num_kv_heads = num_heads;
+    }
+
     // Create attention instance
     auto attention = std::make_unique<MultiHeadAttention>(
         hidden_size, num_heads, head_dim,
@@ -1620,13 +1733,16 @@ std::unique_ptr<MultiHeadAttention> MultiHeadAttention::load(std::istream& is, c
         use_gqa, num_kv_heads,
         max_seq_length, use_fp16
     );
-
-    // Load weight matrices
-    DEBUG_COUT << "Loading weight matrices..." << std::endl;
-    attention->params_.query_weights = Matrix::load(is);
-    attention->params_.key_weights = Matrix::load(is);
-    attention->params_.value_weights = Matrix::load(is);
-    attention->params_.output_weights = Matrix::load(is);
+    if (key_weights.cols() != attention->kv_dim() || value_weights.cols() != attention->kv_dim()) {
+        throw std::runtime_error("MultiHeadAttention::load: K/V weights have " +
+                                 std::to_string(key_weights.cols()) + "/" +
+                                 std::to_string(value_weights.cols()) + " columns, expected kv_dim " +
+                                 std::to_string(attention->kv_dim()));
+    }
+    attention->params_.query_weights = std::move(query_weights);
+    attention->params_.key_weights = std::move(key_weights);
+    attention->params_.value_weights = std::move(value_weights);
+    attention->params_.output_weights = std::move(output_weights);
 
     // Load bias vectors
     DEBUG_COUT << "Loading bias vectors..." << std::endl;
@@ -1998,16 +2114,21 @@ Matrix MultiHeadAttention::forward_fused(const Matrix& input, const AttentionMas
     Matrix qkv_weights(hidden_size, 3 * hidden_size);
     FloatVector qkv_bias(3 * hidden_size);
     
-    // Combine Q, K, V weights and biases
+    // Combine Q, K, V weights and biases. Under GQA the kernel still sees full
+    // width: query head h's K/V columns are KV head h / group's (expanding the
+    // weight columns is the same as expanding the projected K/V).
+    const size_t hd = hidden_size / num_heads;
+    const size_t group = num_heads / kv_heads();
+    auto kv_col = [&](size_t j) { return ((j / hd) / group) * hd + j % hd; };
     for (size_t i = 0; i < hidden_size; ++i) {
         for (size_t j = 0; j < hidden_size; ++j) {
             qkv_weights(i, j) = params_.query_weights(i, j);
-            qkv_weights(i, j + hidden_size) = params_.key_weights(i, j);
-            qkv_weights(i, j + 2 * hidden_size) = params_.value_weights(i, j);
+            qkv_weights(i, j + hidden_size) = params_.key_weights(i, kv_col(j));
+            qkv_weights(i, j + 2 * hidden_size) = params_.value_weights(i, kv_col(j));
         }
         qkv_bias[i] = params_.query_bias[i];
-        qkv_bias[i + hidden_size] = params_.key_bias[i];
-        qkv_bias[i + 2 * hidden_size] = params_.value_bias[i];
+        qkv_bias[i + hidden_size] = params_.key_bias[kv_col(i)];
+        qkv_bias[i + 2 * hidden_size] = params_.value_bias[kv_col(i)];
     }
     
     // Prepare output matrix
@@ -2037,8 +2158,8 @@ Matrix MultiHeadAttention::forward_fused(const Matrix& input, const AttentionMas
     
     // Cache for backward pass (simplified - compute Q, K, V on CPU for gradient caching)
     cached_query_layer = matmul(input, params_.query_weights);
-    cached_key_layer = matmul(input, params_.key_weights);
-    cached_value_layer = matmul(input, params_.value_weights);
+    cached_key_layer = expand_kv_heads(matmul(input, params_.key_weights));
+    cached_value_layer = expand_kv_heads(matmul(input, params_.value_weights));
     cached_attn_output = output;  // Pre-bias output
     cached_attention_weights = Matrix(num_heads * total_seq, total_seq);  // Placeholder
     

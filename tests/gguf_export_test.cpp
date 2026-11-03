@@ -10,8 +10,10 @@
 // writer, never the table, unless the format change is the intended one.
 //
 // Two export contracts are checked on top (3 Nov 2026). A model configured
-// with attention: gqa is still full multi-head attention, so its export is
-// llama_default's file and declares head_count_kv = head_count. And
+// with attention: gqa (one KV head here) holds K/V of [hidden, head_dim]: its
+// file declares head_count_kv = 1 with attn_k/attn_v at that shape, and its
+// HF export num_key_value_heads = 1 with k_proj/v_proj [head_dim, hidden]
+// (its hash was recorded when grouped-query attention was implemented). And
 // tie_word_embeddings, which omits the trained head, is refused (nothing
 // written) unless the head is exactly the transposed embedding with a zero
 // bias; the tied cases' models have such a head, so their files are the
@@ -31,7 +33,10 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "architecture.hpp"
 #include "config.hpp"
@@ -137,8 +142,7 @@ std::shared_ptr<TiktokenTokenizer> vocab(const std::string& path, const std::vec
     return tok;
 }
 
-// gqa_kv_heads > 0 asks for attention: gqa with that many KV heads, which
-// coalfire does not implement (the model is still full multi-head attention).
+// gqa_kv_heads > 0 asks for attention: gqa with that many KV heads.
 std::unique_ptr<Transformer> model(const std::string& family, std::shared_ptr<TiktokenTokenizer> tok,
                                    uint32_t seed, size_t gqa_kv_heads = 0) {
     TransformerConfig cfg;
@@ -233,9 +237,9 @@ const std::map<std::string, std::string> kWant = {
     {"llama_weight_bf16", "refused"},
     {"llama_weight_q8_0", "refused"},
     {"llama_weight_q4_0", "refused"},
-    // attention: gqa is not implemented, so the model is llama_default's (same
-    // seed) and so is its file: head_count_kv is the head count, 2.
-    {"llama_gqa_config", "618d57cb9147d003be9b0236886d527631bb714f2facea51295eaffd76901edf"},
+    // attention: gqa with one KV head (recorded 3 Nov 2026, when grouped-query
+    // attention was implemented): K/V [8, 4], head_count_kv 1.
+    {"llama_gqa_config", "e60a6afeef0c97c6435d93619c14b82c5b5ed3211cf7fa605d95c0e25693a3f6"},
     // tie_word_embeddings would drop a trained head that is not the embedding.
     {"llama_tied_untied_head", "refused"},
     {"vanilla_tied_untied_head", "refused"},
@@ -357,22 +361,61 @@ int main(int argc, char** argv) {
         ++failed;
     }
 
-    // head_count_kv of the gqa-config export, read from the file: the head
-    // count, not the requested num_kv_heads.
+    // The gqa model's attention and its exports: K/V [hidden, head_dim] in the
+    // model, head_count_kv 1 in the GGUF file, num_key_value_heads 1 and
+    // k_proj/v_proj [head_dim, hidden] in the HF export; the multi-head model
+    // still declares its 2 KV heads.
     {
+        auto check = [&](const char* name, bool cond, const std::string& detail) {
+            std::printf("  %-36s %s%s\n", name, cond ? "ok" : "FAIL", cond ? "" : ("  " + detail).c_str());
+            if (!cond) ++failed;
+        };
+        const auto& gap = llama_gqa->getLayers()[0]->getAttention()->parameters();
+        check("gqa_model_kv_shape",
+              gap.key_weights.rows() == 8 && gap.key_weights.cols() == 4 && gap.value_weights.cols() == 4 &&
+                  gap.key_bias.size() == 4 && gap.value_bias.size() == 4,
+              "K " + std::to_string(gap.key_weights.rows()) + "x" + std::to_string(gap.key_weights.cols()));
+
         const std::string path = tmp + "/gguf_export_test_gqa_kv.gguf";
-        std::remove(path.c_str());
-        const bool ok = gguf_export::export_to_gguf(*llama_gqa, *tok, path, Cfg());
-        const int64_t kv = ok ? gguf_u32(path, "llama.attention.head_count_kv") : -2;
-        const int64_t heads = ok ? gguf_u32(path, "llama.attention.head_count") : -2;
-        std::remove(path.c_str());
-        if (kv != 2 || heads != 2) {
-            std::printf("  %-36s head_count %lld, head_count_kv %lld, expected 2 and 2  FAIL\n",
-                        "gqa_config_head_count_kv", static_cast<long long>(heads), static_cast<long long>(kv));
-            ++failed;
-        } else {
-            std::printf("  %-36s ok (head_count_kv 2 = head_count)\n", "gqa_config_head_count_kv");
+        for (const auto& [name, t, want_kv] :
+             {std::make_tuple("gqa_config_head_count_kv", llama_gqa.get(), 1LL),
+              std::make_tuple("mha_head_count_kv", llama.get(), 2LL)}) {
+            std::remove(path.c_str());
+            const bool ok = gguf_export::export_to_gguf(*t, *tok, path, Cfg());
+            const int64_t kv = ok ? gguf_u32(path, "llama.attention.head_count_kv") : -2;
+            const int64_t heads = ok ? gguf_u32(path, "llama.attention.head_count") : -2;
+            std::remove(path.c_str());
+            check(name, kv == want_kv && heads == 2,
+                  "head_count " + std::to_string(heads) + ", head_count_kv " + std::to_string(kv) +
+                      ", expected 2 and " + std::to_string(want_kv));
         }
+
+        const std::string hf = tmp + "/gguf_export_test_gqa_hf";
+        std::error_code ec;
+        std::filesystem::remove_all(hf, ec);
+        const bool ok = safetensors_export::export_to_hf(*llama_gqa, *tok, hf,
+                                                         safetensors_export::SafetensorsExportConfig());
+        nlohmann::json cfg_json, st;
+        if (ok) {
+            cfg_json = nlohmann::json::parse(std::ifstream(hf + "/config.json"));
+            std::ifstream s(hf + "/model.safetensors", std::ios::binary);
+            uint64_t n = 0;
+            s.read(reinterpret_cast<char*>(&n), 8);
+            std::string header(n, '\0');
+            s.read(&header[0], static_cast<std::streamsize>(n));
+            st = nlohmann::json::parse(header);
+        }
+        std::filesystem::remove_all(hf, ec);
+        check("hf_gqa_num_key_value_heads", ok && cfg_json.value("num_key_value_heads", 0) == 1,
+              ok ? "num_key_value_heads " + cfg_json.value("num_key_value_heads", nlohmann::json()).dump()
+                 : "export failed");
+        bool shapes = ok;
+        for (const char* l : {"0", "1"})
+            for (const char* p : {"k_proj", "v_proj"}) {
+                const std::string name = std::string("model.layers.") + l + ".self_attn." + p + ".weight";
+                shapes = shapes && st.contains(name) && st[name]["shape"] == nlohmann::json({4, 8});
+            }
+        check("hf_gqa_kv_proj_shape", shapes, "k_proj/v_proj are not [4, 8]");
     }
 
     // The safetensors and HF exporters share the tie guard: refused, writing

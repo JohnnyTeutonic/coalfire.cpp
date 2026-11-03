@@ -318,6 +318,15 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         target_compile_options(config_init_test PRIVATE -O0 -ftrivial-auto-var-init=pattern)
         add_test(NAME config_init COMMAND config_init_test)
     endif()
+    # Grouped-query attention: forward against a float64 reference, every
+    # gradient against central differences, save/load. It runs the attention
+    # forward, so it is registered in CPU builds only.
+    if(NOT CUDA_ENABLED)
+        add_executable(gqa_attention_test tests/gqa_attention_test.cpp)
+        target_link_libraries(gqa_attention_test PRIVATE transformer_core)
+        target_include_directories(gqa_attention_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        add_test(NAME gqa_attention COMMAND gqa_attention_test)
+    endif()
 endif()
 
 message(STATUS "")

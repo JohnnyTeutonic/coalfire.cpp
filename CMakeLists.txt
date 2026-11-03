@@ -306,6 +306,18 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     target_link_libraries(bpe_export_test PRIVATE transformer_core)
     target_include_directories(bpe_export_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME bpe_export COMMAND bpe_export_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/bpe)
+    # Every scalar TransformerConfig field is initialised: the test fills uninitialised
+    # automatic storage with a byte pattern (GCC 12+, Clang 8+) and looks for it after
+    # construction. Skipped where the compiler lacks the flag (MSVC).
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag(-ftrivial-auto-var-init=pattern COALFIRE_HAS_AUTO_VAR_INIT)
+    if(COALFIRE_HAS_AUTO_VAR_INIT)
+        add_executable(config_init_test tests/config_init_test.cpp)
+        target_link_libraries(config_init_test PRIVATE transformer_core)
+        target_include_directories(config_init_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_compile_options(config_init_test PRIVATE -O0 -ftrivial-auto-var-init=pattern)
+        add_test(NAME config_init COMMAND config_init_test)
+    endif()
 endif()
 
 message(STATUS "")

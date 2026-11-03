@@ -47,7 +47,7 @@ struct TokenPredictionConfig {
 struct PathConfig {
     std::string save_directory;
     std::string model_name;
-    size_t checkpoint_frequency;
+    size_t checkpoint_frequency = 0;  // loaded, not read elsewhere
 };
 
 /**
@@ -107,22 +107,25 @@ struct TransformerConfig {
     // Cross validation parameters
     size_t num_folds = 5;
     
+    // The learning-rate, optimisation and attention flags below take the JSON loader's
+    // defaults (utils.cpp). Without initialisers they were indeterminate unless a config file
+    // set them, and layer construction and checkpoint saving read them.
     // Learning rate parameters
-    float peak_lr;
-    size_t warmup_steps;
-    float decay_factor;
+    float peak_lr = 1e-3f;
+    size_t warmup_steps = 100;
+    float decay_factor = 0.98f;
     
     // Optimization parameters
     float gradient_clip_threshold = 1.0f;
     float layer_norm_epsilon = 1e-5f;  // Prevent division by zero in LayerNorm
     size_t gradient_accumulation_steps = 1;
-    bool use_gradient_checkpointing;
-    bool use_fp16;
-    size_t memory_pool_size;
+    bool use_gradient_checkpointing = false;
+    bool use_fp16 = false;
+    size_t memory_pool_size = 1024;  // MB
 
     // Attention parameters
-    bool use_flash_attention;
-    bool use_rope;
+    bool use_flash_attention = false;
+    bool use_rope = false;
 
     // LLaMA-compatible training mode: RMSNorm instead of LayerNorm, RoPE
     // instead of additive sinusoidal position embeddings, and all biases
@@ -137,9 +140,9 @@ struct TransformerConfig {
     bool use_rms_norm = false;   // RMSNorm (true) vs classic LayerNorm (false)
     bool use_biases = true;      // false freezes all biases at zero (llama)
 
-    bool use_sliding_window;
-    size_t window_size;
-    bool use_gqa;
+    bool use_sliding_window = false;
+    size_t window_size = 0;
+    bool use_gqa = false;
     size_t num_kv_heads;  // Add number of key-value heads for GQA
 
     // Paths

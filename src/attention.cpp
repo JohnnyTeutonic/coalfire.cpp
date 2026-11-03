@@ -313,8 +313,11 @@ Matrix MultiHeadAttention::forward(const Matrix& input, const AttentionMask& mas
     }
 
 #ifdef USE_CUDA
-    // Use fused attention kernel for better performance when available
-    if (use_fused_attention_ && !kv_cache) {
+    // Use fused attention kernel for better performance when available. Not
+    // under grouped-query attention: the fused kernel applies no RoPE and keeps
+    // no backward caches, so a GQA model takes the path below (K/V expanded,
+    // RoPE applied). The multi-head dispatch is unchanged.
+    if (use_fused_attention_ && !kv_cache && !gqa_active()) {
         return forward_fused(input, mask);
     }
 #endif

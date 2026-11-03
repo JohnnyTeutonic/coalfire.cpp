@@ -123,7 +123,10 @@ class LanguageModelHead {
 
 #ifdef USE_CUDA
     // CUDA streams and synchronization
-    cudaStream_t compute_stream;
+    // Never assigned in lm_head.cpp, but released by the destructor when non-null: without an
+    // initialiser it destroyed whatever bytes were there, the likely cause of the CUDA build's
+    // intermittent crash at exit (see train.cpp's fast exit).
+    cudaStream_t compute_stream = nullptr;
 
     // Device memory for active tokens and indices
     unsigned char* d_active_tokens = nullptr;
@@ -137,7 +140,7 @@ class LanguageModelHead {
     __host__ void launch_convert_and_expand_vocab(
         float* output, const half* input, size_t batch_size, size_t vocab_size, size_t active_vocab_size);
 
-    cublasHandle_t cublas_handle;
+    cublasHandle_t cublas_handle = nullptr;  // as compute_stream
 #endif
 
     // Helper methods

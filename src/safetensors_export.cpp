@@ -47,6 +47,8 @@ bool export_to_safetensors(
     if (!export_guard::llama_ffn_biases_zero(transformer, "Safetensors export")) return false;
     if (!export_guard::tied_head_lossless(transformer, config.tie_word_embeddings, "Safetensors export"))
         return false;
+    const size_t n_kv_heads = export_guard::kv_head_count(transformer, "Safetensors export");
+    if (n_kv_heads == 0) return false;
 
     const auto& model_config = transformer.getConfig();
     std::vector<STTensor> tensors;
@@ -145,6 +147,10 @@ bool export_to_safetensors(
         {"use_rope", model_config.use_rope ? "true" : "false"},
         {"tokenizer", "word_level"},
     };
+    // Grouped-query attention: attn_k / attn_v are [kv_dim, hidden]. Recorded
+    // only then, so a multi-head model's header is what it always was.
+    if (n_kv_heads != model_config.num_heads)
+        header["__metadata__"]["num_kv_heads"] = std::to_string(n_kv_heads);
     uint64_t offset = 0;
     for (const auto& t : tensors) {
         const uint64_t nbytes = static_cast<uint64_t>(t.num_elements) * sizeof(float);
@@ -212,6 +218,8 @@ bool export_to_hf(
 ) {
     if (!export_guard::llama_ffn_biases_zero(transformer, "HF export")) return false;
     if (!export_guard::tied_head_lossless(transformer, config.tie_word_embeddings, "HF export")) return false;
+    const size_t n_kv_heads = export_guard::kv_head_count(transformer, "HF export");
+    if (n_kv_heads == 0) return false;
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::create_directories(out_dir, ec);
@@ -241,11 +249,12 @@ bool export_to_hf(
     // q/k: transpose to [out,in] THEN permute the out-rows per head from this
     // codebase's interleaved order [0,1,2,3,...] to HF's split-half order
     // [0,2,4,...,1,3,5,...], so HF rotate_half reproduces interleaved RoPE.
+    // k_proj under GQA has C = n_kv_heads * head_dim rows: permute its heads.
     auto add_qk_permuted = [&](const Matrix& w, const std::string& name) {
         STTensor t; t.name = name;
-        const size_t R = w.rows(), C = w.cols();     // R=in(hidden), C=out(=H)
+        const size_t R = w.rows(), C = w.cols();     // R=in(hidden), C=out(heads*head_dim)
         t.owned = std::make_unique<std::vector<float>>(R * C);
-        for (size_t h = 0; h < n_heads; ++h) {
+        for (size_t h = 0; h < C / head_dim; ++h) {
             for (size_t d = 0; d < head_dim; ++d) {
                 // HF row d within the head maps to this codebase's src row:
                 //   d in [0,head_dim/2) -> 2*d      (even/"cos" lanes)
@@ -339,7 +348,7 @@ bool export_to_hf(
         {"intermediate_size", mc.intermediate_size},
         {"num_hidden_layers", layers.size()},
         {"num_attention_heads", n_heads},
-        {"num_key_value_heads", n_heads},
+        {"num_key_value_heads", n_kv_heads},
         {"vocab_size", vocab},
         {"max_position_embeddings", mc.max_seq_length},
         {"rms_norm_eps", mc.layer_norm_epsilon},

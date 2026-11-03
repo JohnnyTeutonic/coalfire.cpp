@@ -220,6 +220,8 @@ bool export_model(
     std::cout << "GGUF Export: Starting export to " << output_path << std::endl;
     if (!export_guard::llama_ffn_biases_zero(transformer, "GGUF export")) return false;
     if (!export_guard::tied_head_lossless(transformer, config.tie_word_embeddings, "GGUF export")) return false;
+    const size_t kv_heads = export_guard::kv_head_count(transformer, "GGUF export");
+    if (kv_heads == 0) return false;
 
     GGUFWriter writer(output_path);
 
@@ -241,11 +243,11 @@ bool export_model(
     writer.write_metadata_uint32(arch + ".block_count", model_config.num_layers);
     writer.write_metadata_uint32(arch + ".feed_forward_length", model_config.intermediate_size);
     writer.write_metadata_uint32(arch + ".attention.head_count", model_config.num_heads);
-    // The model's attention is full multi-head: K and V are [hidden, hidden],
-    // one K/V head per query head, whatever use_gqa / num_kv_heads say (GQA
-    // is not implemented). Declare the KV heads the tensors hold, as the HF
-    // export's num_key_value_heads does.
-    writer.write_metadata_uint32(arch + ".attention.head_count_kv", model_config.num_heads);
+    // The KV heads the K/V tensors hold (num_heads for multi-head attention,
+    // num_kv_heads under GQA: attn_k/attn_v then have ne = {hidden, kv_dim},
+    // query head h reading KV head h / (head_count / head_count_kv), as
+    // llama.cpp groups them). The HF export's num_key_value_heads agrees.
+    writer.write_metadata_uint32(arch + ".attention.head_count_kv", static_cast<uint32_t>(kv_heads));
     writer.write_metadata_float32(arch + ".attention.layer_norm_rms_epsilon", model_config.layer_norm_epsilon);
     writer.write_metadata_uint32(arch + ".vocab_size", model_config.vocab_size);
 

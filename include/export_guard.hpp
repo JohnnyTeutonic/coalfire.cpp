@@ -80,4 +80,38 @@ inline bool tied_head_lossless(const Transformer& transformer, bool tie_word_emb
     return false;
 }
 
+// The number of K/V heads the model's attention tensors hold: num_heads for full multi-head attention, num_kv_heads
+// under grouped-query attention (K and V [hidden, num_kv_heads * head_dim]; query head h reads KV head
+// h / (num_heads / num_kv_heads), the grouping GGUF llama and HF Llama use). Read from the tensors, not the config,
+// so an export always declares what it writes. Returns 0 (refuse the export) when the layers disagree or the K/V
+// width is not a whole number of heads dividing num_heads.
+inline size_t kv_head_count(const Transformer& transformer, const std::string& what) {
+    const auto& cfg = transformer.getConfig();
+    const size_t n_heads = cfg.num_heads;
+    const size_t head_dim = n_heads ? cfg.hidden_size / n_heads : 0;
+    size_t kv = 0;
+    std::string why;
+    for (const auto& layer : transformer.getLayers()) {
+        const MultiHeadAttention* attn = layer->getAttention();
+        if (!attn) continue;
+        const size_t k_cols = attn->parameters().key_weights.cols();
+        const size_t v_cols = attn->parameters().value_weights.cols();
+        if (head_dim == 0 || k_cols != v_cols || k_cols % head_dim != 0 || k_cols == 0 ||
+            n_heads % (k_cols / head_dim) != 0) {
+            why = "K/V widths " + std::to_string(k_cols) + "/" + std::to_string(v_cols) +
+                  " are not a whole number of heads (head_dim " + std::to_string(head_dim) + ") dividing " +
+                  std::to_string(n_heads) + " heads";
+            break;
+        }
+        if (kv != 0 && kv != k_cols / head_dim) {
+            why = "the layers hold different numbers of K/V heads";
+            break;
+        }
+        kv = k_cols / head_dim;
+    }
+    if (why.empty()) return kv ? kv : n_heads;
+    std::cerr << what << ": refusing to export: " << why << "." << std::endl;
+    return 0;
+}
+
 }  // namespace export_guard

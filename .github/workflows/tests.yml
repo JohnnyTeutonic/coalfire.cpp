@@ -15,7 +15,8 @@ jobs:
     # recorded SHA-256s (tests/gguf_export_test.cpp), and the byte-level BPE
     # tokenizer and its export against paperkiln's (tests/bpe_*_test.cpp),
     # and every TransformerConfig scalar field initialised
-    # (tests/config_init_test.cpp). CPU build.
+    # (tests/config_init_test.cpp), and grouped-query attention's forward,
+    # gradients and save/load (tests/gqa_attention_test.cpp). CPU build.
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
@@ -24,7 +25,7 @@ jobs:
       run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
     - name: Build the GGUF, tokenizer and config tests
-      run: cmake --build build --target gguf_writer_test gguf_export_test bpe_tokenizer_test bpe_export_test config_init_test -j "$(nproc)"
+      run: cmake --build build --target gguf_writer_test gguf_export_test bpe_tokenizer_test bpe_export_test config_init_test gqa_attention_test -j "$(nproc)"
 
     - name: Run
       run: cd build && ctest --output-on-failure
